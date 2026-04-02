@@ -1,4 +1,4 @@
-from ultralytics import YOLO
+    from ultralytics import YOLO
 import cv2
 
 # 1. Carrega o teu modelo treinado
