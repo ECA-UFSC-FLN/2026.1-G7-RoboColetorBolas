@@ -1,0 +1,10 @@
+*vertices 4
+1 a
+2 b
+3 c
+4 d
+*edges
+a b 1
+a c -5
+b d 3
+c d 2
