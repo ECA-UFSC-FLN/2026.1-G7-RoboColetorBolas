@@ -1,19 +1,38 @@
 """
-
-Fluxo:
-  1. Escolha do modo de câmara (iPhone 16 ou configurável)
-  2. Carregamento da imagem
-  3. Undistort (correção de lente)
-  4. Utilizador clica N pontos na imagem (N ∈ {4, 6, 8, 10})
-  5. Para cada ponto, introduz a coordenada real (x, y) em metros
-  6. Homografia calculada empiricamente → warpPerspective
-  7. Imagem retificada mostrada e guardada
+retificador.py  –  Servidor de Retificação por Homografia
+==========================================================
+Fluxo geral:
+  1. Na primeira execução (ou via --calibrar), o utilizador calibra a homografia:
+       - Seleciona a câmara
+       - Abre uma imagem de referência
+       - Clica N pontos e introduz as coordenadas reais em metros
+       - A matriz H e os parâmetros são guardados em 'homografia_calibracao.json'
+  2. Em modo servidor (fluxo normal):
+       - Aguarda ligação do VisionProcessing via socket IPC (porta 6001)
+       - Recebe pacote { frame, bolas_px, indice, timestamp_visao }
+       - Aplica undistort + homografia a cada coordenada de bola
+       - Guarda coordenadas reais em JSON  →  Homografia/Coordenadas retificadas/
+       - Guarda imagem retificada          →  Homografia/Imagem Retificada/
+       - Envia "LIBERADO" de volta ao VisionProcessing
 """
 
 import cv2
 import numpy as np
 import os
 import sys
+import json
+import time
+import argparse
+from pathlib import Path
+from multiprocessing.connection import Listener
+
+# ---------------------------------------------------------------------------
+# CONFIGURAÇÃO DE PASTAS
+# ---------------------------------------------------------------------------
+BASE_DIR         = Path(__file__).parent
+PASTA_COORDS     = BASE_DIR / "Homografia" / "Coordenadas retificadas"
+PASTA_IMAGENS    = BASE_DIR / "Homografia" / "Imagem Retificada"
+FICHEIRO_CALIB   = BASE_DIR / "homografia_calibracao.json"
 
 # ---------------------------------------------------------------------------
 # PARÂMETROS INTRÍNSECOS – iPhone 16
@@ -22,23 +41,16 @@ IPHONE16_W = 4032
 IPHONE16_H = 3024
 
 IPHONE16_INTRINSICS = {
-    "fx": 5823.0,
-    "fy": 5823.0,
-    "cx": 2016.0,
-    "cy": 1512.0,
-    "k1":  0.1220,
-    "k2": -0.2460,
-    "k3":  0.1760,
-    "p1":  0.0001,
-    "p2": -0.0002,
+    "fx": 5823.0, "fy": 5823.0,
+    "cx": 2016.0, "cy": 1512.0,
+    "k1":  0.1220, "k2": -0.2460, "k3": 0.1760,
+    "p1":  0.0001, "p2": -0.0002,
 }
 
-
-# ===========================================================================
-# UTILIDADES DE INPUT
-# ===========================================================================
-
-def pedir_float(mensagem: str, padrao: float | None = None) -> float:
+# ---------------------------------------------------------------------------
+# UTILITÁRIOS DE INPUT
+# ---------------------------------------------------------------------------
+def pedir_float(mensagem: str, padrao=None) -> float:
     sufixo = f" [{padrao}]: " if padrao is not None else ": "
     while True:
         texto = input(mensagem + sufixo).strip()
@@ -50,76 +62,10 @@ def pedir_float(mensagem: str, padrao: float | None = None) -> float:
             print("  ✗ Valor inválido. Introduza um número.")
 
 
-def pedir_int_opcoes(mensagem: str, opcoes: list) -> int:
-    opts_str = "/".join(str(o) for o in opcoes)
-    while True:
-        texto = input(f"{mensagem} ({opts_str}): ").strip()
-        try:
-            val = int(texto)
-            if val in opcoes:
-                return val
-        except ValueError:
-            pass
-        print(f"  ✗ Introduza um dos seguintes valores: {opts_str}")
-
-
-def pedir_caminho_imagem() -> str:
-    while True:
-        caminho = input("\nCaminho da imagem: ").strip().strip('"').strip("'")
-        if os.path.isfile(caminho):
-            return caminho
-        print(f"  ✗ Ficheiro não encontrado: '{caminho}'. Tente novamente.")
-
-
-# ===========================================================================
-# RECOLHA DE PARÂMETROS DA CÂMARA
-# ===========================================================================
-
-def recolher_parametros_iphone16() -> dict:
-    print("\n" + "─" * 60)
-    print("  MODO: iPhone 16 (câmara principal)")
-    print("─" * 60)
-    print("  Intrínsecos carregados automaticamente.\n")
-    params = dict(IPHONE16_INTRINSICS)
-    params["img_w"] = IPHONE16_W
-    params["img_h"] = IPHONE16_H
-    return params
-
-
-def recolher_parametros_configuravel() -> dict:
-    print("\n" + "─" * 60)
-    print("  MODO: Câmara Configurável")
-    print("─" * 60)
-
-    print("\n  [ Resolução do sensor ]")
-    img_w = int(pedir_float("  Largura da imagem (px)"))
-    img_h = int(pedir_float("  Altura da imagem (px)"))
-
-    print("\n  [ Parâmetros intrínsecos ]")
-    fx = pedir_float("  fx – distância focal horizontal (px)")
-    fy = pedir_float("  fy – distância focal vertical   (px)", padrao=fx)
-    cx = pedir_float("  cx – ponto principal X (px)", padrao=img_w / 2)
-    cy = pedir_float("  cy – ponto principal Y (px)", padrao=img_h / 2)
-
-    print("\n  [ Coeficientes de distorção ]")
-    k1 = pedir_float("  k1 (distorção radial 1)",     padrao=0.0)
-    k2 = pedir_float("  k2 (distorção radial 2)",     padrao=0.0)
-    k3 = pedir_float("  k3 (distorção radial 3)",     padrao=0.0)
-    p1 = pedir_float("  p1 (distorção tangencial 1)", padrao=0.0)
-    p2 = pedir_float("  p2 (distorção tangencial 2)", padrao=0.0)
-
-    return {
-        "img_w": img_w, "img_h": img_h,
-        "fx": fx, "fy": fy, "cx": cx, "cy": cy,
-        "k1": k1, "k2": k2, "k3": k3, "p1": p1, "p2": p2,
-    }
-
-
-# ===========================================================================
-# CORREÇÃO DE DISTORÇÃO DE LENTE
-# ===========================================================================
-
-def construir_camera_matrix(p: dict) -> tuple:
+# ---------------------------------------------------------------------------
+# CÂMARA / UNDISTORT
+# ---------------------------------------------------------------------------
+def construir_camera_matrix(p: dict):
     K = np.array([
         [p["fx"],    0.0,   p["cx"]],
         [   0.0,  p["fy"], p["cy"]],
@@ -134,464 +80,464 @@ def aplicar_undistort(img: np.ndarray, p: dict) -> np.ndarray:
     return cv2.undistort(img, K, D)
 
 
-# ===========================================================================
-# SELEÇÃO INTERATIVA DE PONTOS
-# ===========================================================================
+def recolher_params_camara() -> dict:
+    print("\n  Escolha o modo de câmara:")
+    print("  [1]  iPhone 16 – parâmetros automáticos")
+    print("  [2]  Câmara configurável – introdução manual")
+    while True:
+        opc = input("\n  Opção (1 ou 2): ").strip()
+        if opc == "1":
+            p = dict(IPHONE16_INTRINSICS)
+            p["img_w"], p["img_h"] = IPHONE16_W, IPHONE16_H
+            return p
+        if opc == "2":
+            img_w = int(pedir_float("  Largura da imagem (px)"))
+            img_h = int(pedir_float("  Altura da imagem (px)"))
+            fx    = pedir_float("  fx (px)")
+            fy    = pedir_float("  fy (px)", padrao=fx)
+            cx    = pedir_float("  cx (px)", padrao=img_w / 2)
+            cy    = pedir_float("  cy (px)", padrao=img_h / 2)
+            k1    = pedir_float("  k1", padrao=0.0)
+            k2    = pedir_float("  k2", padrao=0.0)
+            k3    = pedir_float("  k3", padrao=0.0)
+            p1    = pedir_float("  p1", padrao=0.0)
+            p2    = pedir_float("  p2", padrao=0.0)
+            return {"img_w": img_w, "img_h": img_h,
+                    "fx": fx, "fy": fy, "cx": cx, "cy": cy,
+                    "k1": k1, "k2": k2, "k3": k3, "p1": p1, "p2": p2}
+        print("  ✗ Introduza 1 ou 2.")
 
-CORES = [
-    (  0, 255,   0),  # verde
-    (  0, 128, 255),  # laranja
-    (255,   0, 255),  # magenta
-    (  0, 255, 255),  # amarelo
-    (255,   0,   0),  # azul
-    (  0,   0, 255),  # vermelho
-    (255, 255,   0),  # ciano
-    (128,   0, 255),  # roxo
-    (  0, 200, 100),
-    (200, 100,   0),
-]
-LABELS = ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J"]
 
-# Estado global para o callback do rato
+# ---------------------------------------------------------------------------
+# SELEÇÃO INTERATIVA DE PONTOS (mantida do original)
+# ---------------------------------------------------------------------------
+CORES  = [(0,255,0),(0,128,255),(255,0,255),(0,255,255),
+          (255,0,0),(0,0,255),(255,255,0),(128,0,255),(0,200,100),(200,100,0)]
+LABELS = ["A","B","C","D","E","F","G","H","I","J"]
 _estado = {}
 
 
 def _redesenhar_pontos():
-    """Reconstrói img_display com os pontos atuais a partir da imagem limpa."""
     img_base = _estado["img_display_limpa"].copy()
     for i, (px, py) in enumerate(_estado["pontos_img"]):
-        # Converte de volta para coordenadas de ecrã
         escala     = _estado["escala"]
         barra_h_px = _estado["barra_h_px"]
         sx = int(px * escala)
         sy = int(py * escala) + barra_h_px
         cor   = CORES[i % len(CORES)]
         label = LABELS[i]
-        cv2.circle(img_base, (sx, sy), 9, (255, 255, 255), 2)
+        cv2.circle(img_base, (sx, sy), 9, (255,255,255), 2)
         cv2.circle(img_base, (sx, sy), 7, cor, -1)
-        cv2.putText(
-            img_base, label,
-            (sx + 12, sy - 8),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.75, cor, 2, cv2.LINE_AA,
-        )
+        cv2.putText(img_base, label, (sx+12, sy-8),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.75, cor, 2, cv2.LINE_AA)
     _estado["img_display"] = img_base
 
 
 def _atualizar_barra(mensagem: str):
-    """Atualiza o texto da barra de instrução no topo."""
     barra_h_px = _estado["barra_h_px"]
     largura    = _estado["img_display"].shape[1]
     barra = np.full((barra_h_px, largura, 3), 30, dtype=np.uint8)
-    cv2.putText(
-        barra, mensagem,
-        (10, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (200, 200, 200), 1, cv2.LINE_AA,
-    )
+    cv2.putText(barra, mensagem, (10,26),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.52, (200,200,200), 1, cv2.LINE_AA)
     _estado["img_display"][:barra_h_px] = barra
 
 
 def _callback_rato(evento, x, y, flags, param):
     if _estado.get("concluido"):
         return
-
     if evento == cv2.EVENT_LBUTTONDOWN:
         n_atual = len(_estado["pontos_img"])
         if n_atual >= _estado["n_pontos"]:
             return
-
-        # Guarda ponto em coordenadas da imagem original (desfaz escala + offset barra)
         escala     = _estado["escala"]
         barra_h_px = _estado["barra_h_px"]
         x_orig = int(x / escala)
-        y_orig = int((y - barra_h_px) / escala)
-        y_orig = max(0, y_orig)
+        y_orig = max(0, int((y - barra_h_px) / escala))
         _estado["pontos_img"].append((x_orig, y_orig))
-
-        # Desenha marcador colorido
         cor   = CORES[n_atual % len(CORES)]
         label = LABELS[n_atual]
-        cv2.circle(_estado["img_display"], (x, y), 9, (255, 255, 255), 2)
-        cv2.circle(_estado["img_display"], (x, y), 7, cor, -1)
-        cv2.putText(
-            _estado["img_display"], label,
-            (x + 12, y - 8),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.75, cor, 2, cv2.LINE_AA,
-        )
-
+        cv2.circle(_estado["img_display"], (x,y), 9, (255,255,255), 2)
+        cv2.circle(_estado["img_display"], (x,y), 7, cor, -1)
+        cv2.putText(_estado["img_display"], label, (x+12, y-8),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.75, cor, 2, cv2.LINE_AA)
         n_atual += 1
-        restam   = _estado["n_pontos"] - n_atual
+        restam = _estado["n_pontos"] - n_atual
         if restam > 0:
-            proximo_label = LABELS[n_atual]
-            msg = (f"Ponto {label} OK  |  Clique {proximo_label} "
+            msg = (f"Ponto {label} OK  |  Clique {LABELS[n_atual]} "
                    f"({n_atual}/{_estado['n_pontos']})  |  Z=desfazer  R=recomeçar  ESC=cancelar")
             _atualizar_barra(msg)
             cv2.imshow("Selecionar Pontos", _estado["img_display"])
-            print(f"  ✓ Ponto {label} ({x_orig}, {y_orig}) px  "
-                  f"→  clique o ponto {proximo_label}  (faltam {restam})")
+            print(f"  ✓ Ponto {label} ({x_orig},{y_orig})px → clique {LABELS[n_atual]}")
         else:
             msg = (f"Todos os {_estado['n_pontos']} pontos OK  |  "
-                   f"ENTER=confirmar  Z=desfazer último  R=recomeçar  ESC=cancelar")
+                   f"ENTER=confirmar  Z=desfazer  R=recomeçar  ESC=cancelar")
             _atualizar_barra(msg)
             cv2.imshow("Selecionar Pontos", _estado["img_display"])
-            print(f"  ✓ Ponto {label} ({x_orig}, {y_orig}) px")
+            print(f"  ✓ Ponto {label} ({x_orig},{y_orig})px")
             print("\n  Todos os pontos selecionados. Prima ENTER para continuar.")
             _estado["concluido"] = True
 
 
 def selecionar_pontos(img_undist: np.ndarray, n_pontos: int) -> list:
-    """Abre janela interativa; devolve lista de (x,y) em coords da imagem original.
-
-    Controlos:
-      Clique esquerdo - adiciona ponto
-      Z               - desfaz o ultimo ponto
-      R               - recomeça (apaga todos os pontos)
-      ENTER           - confirma (so apos todos os pontos selecionados)
-      ESC             - cancela e sai
-    """
-    MAX_DIM  = 1100
-    h, w     = img_undist.shape[:2]
-    escala   = min(1.0, MAX_DIM / max(h, w))
-    img_vis  = cv2.resize(img_undist, (int(w * escala), int(h * escala)))
-
-    # Barra de instrucao no topo
-    BARRA_H  = 38
-    barra    = np.full((BARRA_H, img_vis.shape[1], 3), 30, dtype=np.uint8)
-    msg_inicial = f"Clique o ponto A  (0/{n_pontos})  |  Z=desfazer  R=recomecar  ESC=cancelar"
-    cv2.putText(
-        barra, msg_inicial,
-        (10, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (200, 200, 200), 1, cv2.LINE_AA,
-    )
+    MAX_DIM = 1100
+    h, w    = img_undist.shape[:2]
+    escala  = min(1.0, MAX_DIM / max(h, w))
+    img_vis = cv2.resize(img_undist, (int(w*escala), int(h*escala)))
+    BARRA_H = 38
+    barra   = np.full((BARRA_H, img_vis.shape[1], 3), 30, dtype=np.uint8)
+    msg0    = f"Clique o ponto A  (0/{n_pontos})  |  Z=desfazer  R=recomeçar  ESC=cancelar"
+    cv2.putText(barra, msg0, (10,26), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (200,200,200), 1, cv2.LINE_AA)
     img_display = np.vstack([barra, img_vis])
-    # Copia limpa sem marcadores para poder redesenhar ao desfazer
-    img_display_limpa = img_display.copy()
-
     _estado.clear()
     _estado.update({
-        "pontos_img":        [],
-        "n_pontos":          n_pontos,
-        "img_display":       img_display,
-        "img_display_limpa": img_display_limpa,
-        "escala":            escala,
-        "barra_h_px":        BARRA_H,
-        "concluido":         False,
+        "pontos_img": [], "n_pontos": n_pontos,
+        "img_display": img_display,
+        "img_display_limpa": img_display.copy(),
+        "escala": escala, "barra_h_px": BARRA_H, "concluido": False,
     })
-
     cv2.namedWindow("Selecionar Pontos", cv2.WINDOW_NORMAL)
     cv2.setMouseCallback("Selecionar Pontos", _callback_rato)
     cv2.imshow("Selecionar Pontos", img_display)
-    print(f"  Clique o ponto A na janela da imagem...")
-    print(f"  Z = desfazer ultimo ponto  |  R = recomecar  |  ESC = cancelar")
-
+    print(f"  Clique o ponto A...   Z=desfazer | R=recomeçar | ESC=cancelar")
     while True:
         tecla = cv2.waitKey(50) & 0xFF
-
-        if _estado["concluido"] and tecla == 13:    # ENTER – confirmar
+        if _estado["concluido"] and tecla == 13:
             break
-
-        if tecla == 27:                              # ESC – cancelar
-            print("\n  ✗ Operacao cancelada.")
+        if tecla == 27:
             cv2.destroyAllWindows()
             sys.exit(0)
-
-        if tecla in (ord('z'), ord('Z')):            # Z – desfazer ultimo ponto
-            if _estado["pontos_img"]:
-                removido = _estado["pontos_img"].pop()
-                _estado["concluido"] = False
-                _redesenhar_pontos()
-                n_atual = len(_estado["pontos_img"])
-                proximo_label = LABELS[n_atual]
-                msg = (f"Ponto {LABELS[n_atual]} removido  |  Clique {proximo_label} "
-                       f"({n_atual}/{n_pontos})  |  Z=desfazer  R=recomecar  ESC=cancelar")
-                _atualizar_barra(msg)
-                cv2.imshow("Selecionar Pontos", _estado["img_display"])
-                print(f"  ↩  Ponto {LABELS[n_atual]} removido {removido}. "
-                      f"Clique novamente o ponto {proximo_label}.")
-            else:
-                print("  ✗ Nao ha pontos para desfazer.")
-
-        if tecla in (ord('r'), ord('R')):            # R – recomecar do zero
-            if _estado["pontos_img"]:
-                _estado["pontos_img"].clear()
-                _estado["concluido"] = False
-                _estado["img_display"] = _estado["img_display_limpa"].copy()
-                _atualizar_barra(msg_inicial)
-                cv2.imshow("Selecionar Pontos", _estado["img_display"])
-                print("  ↩  Todos os pontos apagados. Recomeçe a clicar o ponto A.")
-            else:
-                print("  ✗ Ainda nao ha pontos para apagar.")
-
+        if tecla in (ord('z'), ord('Z')) and _estado["pontos_img"]:
+            _estado["pontos_img"].pop()
+            _estado["concluido"] = False
+            _redesenhar_pontos()
+            n = len(_estado["pontos_img"])
+            _atualizar_barra(f"Desfez  |  Clique {LABELS[n]} ({n}/{n_pontos})")
+            cv2.imshow("Selecionar Pontos", _estado["img_display"])
+        if tecla in (ord('r'), ord('R')) and _estado["pontos_img"]:
+            _estado["pontos_img"].clear()
+            _estado["concluido"] = False
+            _estado["img_display"] = _estado["img_display_limpa"].copy()
+            _atualizar_barra(msg0)
+            cv2.imshow("Selecionar Pontos", _estado["img_display"])
     cv2.destroyAllWindows()
     return list(_estado["pontos_img"])
 
 
-# ===========================================================================
-# RECOLHA DE COORDENADAS REAIS
-# ===========================================================================
-
 def recolher_coordenadas_reais(n_pontos: int) -> list:
-    print("\n" + "─" * 60)
-    print("  COORDENADAS REAIS DOS PONTOS")
-    print("  Origem (0.0, 0.0) = canto superior esquerdo da area")
-    print("  X → direita   |   Y → profundidade (para baixo)")
-    print("  Escreva \'v\' ou \'voltar\' para anular o ponto anterior.")
-    print("─" * 60)
-
+    print("\n" + "─"*60)
+    print("  COORDENADAS REAIS  |  Origem (0,0) = canto sup. esquerdo")
+    print("  X → direita        |  Y → profundidade (para baixo)  [metros]")
+    print("─"*60)
     coords = []
     i = 0
     while i < n_pontos:
-        label = LABELS[i]
-        print(f"\n  Ponto {label}  ({i+1}/{n_pontos}):")
-
-        # Pede x real
+        label  = LABELS[i]
         voltou = False
+        print(f"\n  Ponto {label}  ({i+1}/{n_pontos}):")
         while True:
-            texto = input("    x real (m)  [ou \'v\' para voltar]: ").strip()
-            if texto.lower() in ("v", "voltar"):
+            t = input("    x real (m)  [ou 'v' para voltar]: ").strip()
+            if t.lower() in ("v","voltar"):
                 if i > 0:
-                    coords.pop()
-                    i -= 1
-                    print(f"  ↩  Ponto {LABELS[i]} anulado. Reintroduz o ponto {LABELS[i]}.")
+                    coords.pop(); i -= 1
+                    print(f"  ↩  Voltou ao ponto {LABELS[i]}.")
                 else:
-                    print("  ✗ Ja esta no primeiro ponto, nao ha nada para anular.")
-                voltou = True
-                break
+                    print("  ✗ Já está no primeiro ponto.")
+                voltou = True; break
             try:
-                x_r = float(texto)
-                break
+                x_r = float(t); break
             except ValueError:
-                print("  ✗ Valor invalido. Introduza um numero.")
-
+                print("  ✗ Valor inválido.")
         if voltou:
             continue
-
-        # Pede y real
         while True:
-            texto2 = input("    y real (m)  [ou \'v\' para voltar]: ").strip()
-            if texto2.lower() in ("v", "voltar"):
-                print(f"  ↩  Reintroduz o ponto {label} desde o inicio.")
-                voltou = True
-                break
+            t2 = input("    y real (m)  [ou 'v' para voltar]: ").strip()
+            if t2.lower() in ("v","voltar"):
+                print(f"  ↩  Reintroduz o ponto {label}.")
+                voltou = True; break
             try:
-                y_r = float(texto2)
-                break
+                y_r = float(t2); break
             except ValueError:
-                print("  ✗ Valor invalido. Introduza um numero.")
-
+                print("  ✗ Valor inválido.")
         if voltou:
             continue
-
         coords.append((x_r, y_r))
         i += 1
-
     return coords
 
 
-# ===========================================================================
-# HOMOGRAFIA E WARP
-# ===========================================================================
+# ---------------------------------------------------------------------------
+# CALIBRAÇÃO – calcula H e guarda em JSON
+# ---------------------------------------------------------------------------
+def calibrar_e_guardar() -> dict:
+    """Fluxo interativo de calibração. Devolve o dict de calibração."""
+    print("\n" + "═"*60)
+    print("  CALIBRAÇÃO DA HOMOGRAFIA")
+    print("  Selecione uma imagem de referência da quadra,")
+    print("  clique os pontos de referência e introduza as")
+    print("  respetivas coordenadas reais em metros.")
+    print("═"*60)
 
-def aplicar_homografia(img_undist: np.ndarray,
-                        pts_img: list,
-                        pts_reais: list) -> tuple:
-    """
-    Calcula homografia entre pts_img (píxeis) e pts_reais (metros),
-    aplica warpPerspective e devolve (imagem_retificada, px_por_metro).
-    """
-    xs    = [p[0] for p in pts_reais]
-    ys    = [p[1] for p in pts_reais]
-    x_min = min(xs)
-    y_min = min(ys)
+    params = recolher_params_camara()
+
+    while True:
+        caminho = input("\nCaminho da imagem de referência: ").strip().strip('"').strip("'")
+        if os.path.isfile(caminho):
+            break
+        print(f"  ✗ Ficheiro não encontrado: '{caminho}'")
+
+    img = cv2.imread(caminho)
+    if img is None:
+        print("  ✗ Não foi possível ler a imagem.")
+        sys.exit(1)
+
+    h_img, w_img = img.shape[:2]
+    if w_img != params["img_w"] or h_img != params["img_h"]:
+        print(f"  ⚠  Redimensionando imagem de ({w_img}x{h_img}) "
+              f"para ({params['img_w']}x{params['img_h']}).")
+        img = cv2.resize(img, (params["img_w"], params["img_h"]))
+
+    print("\n  A corrigir distorção da lente...")
+    img_undist = aplicar_undistort(img, params)
+
+    # Número de pontos
+    while True:
+        try:
+            n = int(input("\n  Número de pontos de referência (4/6/8/10): ").strip())
+            if n in (4,6,8,10):
+                break
+        except ValueError:
+            pass
+        print("  ✗ Introduza 4, 6, 8 ou 10.")
+
+    print(f"\n  Vai abrir a imagem. Clique {n} pontos de referência.")
+    input("  Prima ENTER para continuar...")
+    pts_img   = selecionar_pontos(img_undist, n)
+    pts_reais = recolher_coordenadas_reais(n)
+
+    # Calcular H para guardar
+    xs, ys  = [p[0] for p in pts_reais], [p[1] for p in pts_reais]
+    x_min, y_min = min(xs), min(ys)
     W_real = max(xs) - x_min
     D_real = max(ys) - y_min
 
-    # Resolução: adapta ao tamanho da imagem de entrada
     h_in, w_in = img_undist.shape[:2]
     ppm = max(w_in, h_in) / max(W_real, D_real) if max(W_real, D_real) > 0 else 200.0
-    out_w = int(W_real * ppm)
-    out_h = int(D_real * ppm)
-
-    # Destino em píxeis
-    pts_destino = np.array(
-        [((p[0] - x_min) * ppm, (p[1] - y_min) * ppm) for p in pts_reais],
-        dtype=np.float32,
-    )
-    pts_origem = np.array(pts_img, dtype=np.float32)
+    pts_dst = np.array([((p[0]-x_min)*ppm, (p[1]-y_min)*ppm) for p in pts_reais], dtype=np.float32)
+    pts_src = np.array(pts_img, dtype=np.float32)
 
     if len(pts_img) == 4:
-        H_mat, _ = cv2.findHomography(pts_origem, pts_destino)
+        H_mat, _ = cv2.findHomography(pts_src, pts_dst)
     else:
-        H_mat, _ = cv2.findHomography(
-            pts_origem, pts_destino, cv2.RANSAC, ransacReprojThreshold=5.0
-        )
+        H_mat, _ = cv2.findHomography(pts_src, pts_dst, cv2.RANSAC, ransacReprojThreshold=5.0)
 
     if H_mat is None:
-        print("\n  ✗ Não foi possível calcular a homografia.")
-        print("  Verifique se os pontos não são colineares.")
+        print("  ✗ Não foi possível calcular a homografia. Pontos colineares?")
         sys.exit(1)
 
-    img_ret = cv2.warpPerspective(img_undist, H_mat, (out_w, out_h))
-    return img_ret, ppm, W_real, D_real
+    calib = {
+        "params_camara": params,
+        "pts_img":        pts_img,
+        "pts_reais":      pts_reais,
+        "H_mat":          H_mat.tolist(),
+        "ppm":            ppm,
+        "x_min":          x_min,
+        "y_min":          y_min,
+        "W_real":         W_real,
+        "D_real":         D_real,
+        "out_w":          int(W_real * ppm),
+        "out_h":          int(D_real * ppm),
+    }
+
+    with open(FICHEIRO_CALIB, "w") as f:
+        json.dump(calib, f, indent=4)
+
+    print(f"\n  ✓ Calibração guardada em: {FICHEIRO_CALIB}")
+    print(f"  ✓ Área calibrada: {W_real:.2f} m × {D_real:.2f} m")
+    print(f"  ✓ Resolução: {ppm:.0f} px/m")
+    return calib
 
 
-# ===========================================================================
-# GUARDAR E MOSTRAR
-# ===========================================================================
+def carregar_calibracao() -> dict:
+    """Carrega calibração de ficheiro JSON ou executa o fluxo de calibração."""
+    if not FICHEIRO_CALIB.exists():
+        print(f"  ⚠  Ficheiro de calibração não encontrado: {FICHEIRO_CALIB}")
+        print("  A iniciar fluxo de calibração...")
+        return calibrar_e_guardar()
 
-def guardar_imagem(img: np.ndarray, caminho_original: str) -> str:
-    pasta = os.path.dirname(os.path.abspath(__file__))
-    nome  = os.path.splitext(os.path.basename(caminho_original))[0]
-    saida = os.path.join(pasta, f"{nome}_retificada.jpg")
-    cv2.imwrite(saida, img, [cv2.IMWRITE_JPEG_QUALITY, 95])
-    return saida
+    with open(FICHEIRO_CALIB) as f:
+        calib = json.load(f)
 
-
-def mostrar_imagem(img: np.ndarray, titulo: str = "Imagem Retificada") -> None:
-    MAX_DIM = 1100
-    h, w    = img.shape[:2]
-    if max(h, w) > MAX_DIM:
-        escala  = MAX_DIM / max(h, w)
-        img_vis = cv2.resize(img, (int(w * escala), int(h * escala)))
-    else:
-        img_vis = img
-
-    cv2.imshow(titulo, img_vis)
-    print("\n  Prima qualquer tecla na janela da imagem para fechar...")
-    cv2.waitKey(0)
-    cv2.destroyAllWindows()
+    calib["H_mat"] = np.array(calib["H_mat"], dtype=np.float64)
+    print(f"  ✓ Calibração carregada de: {FICHEIRO_CALIB}")
+    print(f"  ✓ Área: {calib['W_real']:.2f} m × {calib['D_real']:.2f} m  "
+          f"| {calib['ppm']:.0f} px/m")
+    return calib
 
 
-# ===========================================================================
-# MAIN
-# ===========================================================================
+# ---------------------------------------------------------------------------
+# TRANSFORMAÇÃO DE COORDENADAS  pixel → metros
+# ---------------------------------------------------------------------------
+def pixel_para_real(px: float, py: float, H_mat: np.ndarray,
+                    ppm: float, x_min: float, y_min: float) -> tuple:
+    """
+    Aplica a homografia H a um ponto (px, py) em pixels e devolve
+    (x_m, y_m) em metros no referencial real.
+    """
+    pt = np.array([[[px, py]]], dtype=np.float32)
+    pt_ret = cv2.perspectiveTransform(pt, H_mat)
+    x_ret_px = float(pt_ret[0][0][0])
+    y_ret_px = float(pt_ret[0][0][1])
+    x_m = x_ret_px / ppm + x_min
+    y_m = y_ret_px / ppm + y_min
+    return round(x_m, 4), round(y_m, 4)
 
-def _pedir_camara() -> dict:
-    """Pede o modo de camara e devolve os parametros. Suporta 'v' para voltar ao menu."""
+
+# ---------------------------------------------------------------------------
+# SERVIDOR IPC  (porta 6001)
+# ---------------------------------------------------------------------------
+def servidor_retificacao(calib: dict):
+    """Loop principal: aguarda pacotes do VisionProcessing e retifica."""
+    PASTA_COORDS.mkdir(parents=True, exist_ok=True)
+    PASTA_IMAGENS.mkdir(parents=True, exist_ok=True)
+
+    H_mat  = calib["H_mat"]
+    ppm    = calib["ppm"]
+    x_min  = calib["x_min"]
+    y_min  = calib["y_min"]
+    out_w  = calib["out_w"]
+    out_h  = calib["out_h"]
+    params = calib["params_camara"]
+
+    address  = ('localhost', 6001)
+    listener = Listener(address, authkey=b'retificador_ufsc')
+
+    print("\n" + "═"*60)
+    print("  SERVIDOR DE RETIFICAÇÃO ATIVO  –  porta 6001")
+    print("  Aguardando ligação do VisionProcessing...")
+    print("═"*60)
+
+    indice = 0
     while True:
-        print("\n  Escolha o modo de camara:")
-        print("  [1]  iPhone 16 (camara principal) – parametros padrao")
-        print("  [2]  Camara configuravel           – introducao manual")
-        escolha = input("\n  Opcao (1 ou 2): ").strip()
-        if escolha == "1":
-            return recolher_parametros_iphone16()
-        if escolha == "2":
-            return recolher_parametros_configuravel()
-        print("  ✗ Opcao invalida. Introduza 1 ou 2.")
+        conn = listener.accept()
+        print(f"\n[ETAPA] Ligação estabelecida com o VisionProcessing.")
 
+        try:
+            # ── Receber pacote ─────────────────────────────────────────────
+            t_recv = time.time()
+            pacote = conn.recv()
 
-def _pedir_imagem_e_params(params: dict) -> tuple:
-    """Pede caminho da imagem e devolve (img, img_undist, caminho).
-    Devolve None se o utilizador quiser voltar atras (escreve 'v')."""
-    while True:
-        caminho = input("\nCaminho da imagem  [ou 'v' para voltar a escolha da camara]: ").strip().strip('"').strip("'")
-        if caminho.lower() in ("v", "voltar"):
-            return None
-        if not os.path.isfile(caminho):
-            print(f"  ✗ Ficheiro nao encontrado: '{caminho}'. Tente novamente.")
-            continue
+            timestamp_visao = pacote["timestamp_visao"]
+            frame           = pacote["frame"]
+            bolas_px        = pacote["bolas_px"]   # lista de {"x1","y1","x2","y2"}
+            idx_visao       = pacote["indice"]
 
-        img = cv2.imread(caminho)
-        if img is None:
-            print(f"  ✗ Nao foi possivel ler a imagem: '{caminho}'")
-            continue
+            print(f"[ETAPA] Pacote #{idx_visao} recebido  "
+                  f"| {len(bolas_px)} bola(s) detetada(s).")
 
-        h_img, w_img = img.shape[:2]
-        if w_img != params["img_w"] or h_img != params["img_h"]:
-            print(f"\n  ⚠  Imagem ({w_img}x{h_img}) redimensionada para "
-                  f"{params['img_w']}x{params['img_h']}.")
-            img = cv2.resize(img, (params["img_w"], params["img_h"]))
+            # ── Timer: início do processamento ─────────────────────────────
+            t_proc_inicio = time.time()
 
-        return img, caminho
+            # ── Undistort do frame ─────────────────────────────────────────
+            img_undist = aplicar_undistort(frame, params)
 
+            # ── Warp da imagem completa ─────────────────────────────────────
+            img_ret = cv2.warpPerspective(img_undist, H_mat, (out_w, out_h))
 
-def main() -> None:
+            # ── Converter coordenadas pixel → metros ───────────────────────
+            bolas_reais = []
+            for b in bolas_px:
+                # Centro da bounding box em pixels (coordenadas undistorted)
+                cx_px = (b["x1"] + b["x2"]) / 2.0
+                cy_px = (b["y1"] + b["y2"]) / 2.0
+                x_m, y_m = pixel_para_real(cx_px, cy_px, H_mat, ppm, x_min, y_min)
 
-    # ── Aviso inicial ──────────────────────────────────────────────────────
-    print("\n" + "═" * 60)
-    print("  ⚠  ATENCAO ANTES DE CONTINUAR:")
-    print("  Garanta que todo o campo de recolha desejado")
-    print("  e completamente visivel na imagem capturada.")
-    print("  Areas fora do enquadramento nao serao recuperaveis.")
-    print("═" * 60)
+                # Centro projetado na imagem retificada (para visualização)
+                cx_ret = (cx_px * H_mat[0,0] + cy_px * H_mat[0,1] + H_mat[0,2])
+                cy_ret = (cx_px * H_mat[1,0] + cy_px * H_mat[1,1] + H_mat[1,2])
+                w_ret  = (cx_px * H_mat[2,0] + cy_px * H_mat[2,1] + H_mat[2,2])
+                if w_ret != 0:
+                    cx_ret = int(cx_ret / w_ret)
+                    cy_ret = int(cy_ret / w_ret)
+                else:
+                    cx_ret, cy_ret = 0, 0
 
-    # ── Passo 1: Modo de camara (com possibilidade de repetir) ─────────────
-    PASSO = 1
-    params       = None
-    caminho_img  = None
-    img          = None
-    img_undist   = None
-    n_pontos     = None
-    pts_img      = None
+                bolas_reais.append({
+                    "centro_px_original": {"x": round(cx_px, 1), "y": round(cy_px, 1)},
+                    "centro_real_m":      {"x": x_m, "y": y_m},
+                    "bbox_px":            b,
+                })
 
-    while PASSO <= 5:
+                # Desenha ponto na imagem retificada
+                cv2.circle(img_ret, (cx_ret, cy_ret), 8, (0,255,0), -1)
+                cv2.circle(img_ret, (cx_ret, cy_ret), 10, (255,255,255), 2)
+                cv2.putText(img_ret,
+                            f"({x_m:.2f}m, {y_m:.2f}m)",
+                            (cx_ret + 12, cy_ret - 8),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0,255,0), 1, cv2.LINE_AA)
 
-        # ── 1. Escolha da camara ───────────────────────────────────────────
-        if PASSO == 1:
-            params = _pedir_camara()
-            PASSO = 2
+            # ── Timers ─────────────────────────────────────────────────────
+            t_proc_fim      = time.time()
+            latencia_total  = (t_proc_fim - timestamp_visao) * 1000   # ms (ponta-a-ponta)
+            latencia_ret    = (t_proc_fim - t_proc_inicio)   * 1000   # ms (só retificação)
 
-        # ── 2. Carregar imagem ─────────────────────────────────────────────
-        elif PASSO == 2:
-            resultado = _pedir_imagem_e_params(params)
-            if resultado is None:          # utilizador quer voltar atras
-                PASSO = 1
-                continue
-            img, caminho_img = resultado
-            print("\n  A corrigir distorcao da lente...")
-            img_undist = aplicar_undistort(img, params)
-            PASSO = 3
+            # ── Guardar JSON ────────────────────────────────────────────────
+            nome_json = f"coordenadas_ret_{indice:04d}.json"
+            saida_json = {
+                "indice":              indice,
+                "indice_visao":        idx_visao,
+                "latencia_total_ms":   round(latencia_total, 2),
+                "latencia_ret_ms":     round(latencia_ret, 2),
+                "area_m":              {"largura": calib["W_real"], "profundidade": calib["D_real"]},
+                "bolas":               bolas_reais,
+            }
+            with open(PASTA_COORDS / nome_json, "w") as f:
+                json.dump(saida_json, f, indent=4)
 
-        # ── 3. Numero de pontos ────────────────────────────────────────────
-        elif PASSO == 3:
-            print("\n" + "─" * 60)
-            print("  CALIBRACAO POR PONTOS DE REFERENCIA")
-            print("─" * 60)
-            print("  Vai clicar N pontos na imagem cujas posicoes reais conhece.")
-            print("  Recomendacao: use os cantos da area de interesse (4 pontos),")
-            print("  ou pontos extra para maior robustez (6, 8, 10).\n")
-            print("  Escreva 'v' para voltar a escolha da imagem.")
-            texto_n = input("  Numero de pontos (4/6/8/10): ").strip()
-            if texto_n.lower() in ("v", "voltar"):
-                PASSO = 2
-                continue
+            # ── Guardar imagem retificada ───────────────────────────────────
+            nome_img = f"imagem_ret_{indice:04d}.jpg"
+            cv2.imwrite(str(PASTA_IMAGENS / nome_img), img_ret,
+                        [cv2.IMWRITE_JPEG_QUALITY, 92])
+
+            print(f"[ETAPA]  JSON  → {PASTA_COORDS / nome_json}")
+            print(f"[ETAPA]  IMG   → {PASTA_IMAGENS / nome_img}")
+            print(f"[SUCESSO] Latência total: {latencia_total:.1f} ms  "
+                  f"| Retificação: {latencia_ret:.1f} ms  "
+                  f"| Bolas: {len(bolas_reais)}")
+
+            # ── Sinal de libertação ─────────────────────────────────────────
+            conn.send("LIBERADO")
+            indice += 1
+
+        except Exception as e:
+            print(f"[ERRO] Falha no processamento: {e}")
             try:
-                n_pontos = int(texto_n)
-                if n_pontos not in (4, 6, 8, 10):
-                    raise ValueError
-            except ValueError:
-                print("  ✗ Introduza 4, 6, 8 ou 10.")
-                continue
-            PASSO = 4
+                conn.send("LIBERADO")   # liberta mesmo em caso de erro
+            except Exception:
+                pass
+        finally:
+            conn.close()
+            print("[ESTADO] Retificador resetado. Aguardando próxima captura...")
 
-        # ── 4. Selecao interativa de pontos ────────────────────────────────
-        elif PASSO == 4:
-            print(f"\n  Vai abrir a imagem. Clique {n_pontos} pontos.")
-            print("  Na janela: Z=desfazer ultimo  R=recomecar  ESC=cancelar")
-            print("  De seguida, introduz as coordenadas reais de cada ponto.\n")
-            resp = input("  Prima ENTER para abrir a imagem  [ou 'v' para voltar]: ").strip()
-            if resp.lower() in ("v", "voltar"):
-                PASSO = 3
-                continue
-            pts_img = selecionar_pontos(img_undist, n_pontos)
-            PASSO = 5
 
-        # ── 5. Coordenadas reais ────────────────────────────────────────────
-        elif PASSO == 5:
-            pts_reais = recolher_coordenadas_reais(n_pontos)
-            # Nao ha volta atras daqui – mas o proprio recolher suporta 'v' ponto a ponto
-            break
+# ---------------------------------------------------------------------------
+# MAIN
+# ---------------------------------------------------------------------------
+def main():
+    parser = argparse.ArgumentParser(description="Servidor de Retificação por Homografia")
+    parser.add_argument("--calibrar", action="store_true",
+                        help="Forçar nova calibração mesmo que já exista uma guardada.")
+    args = parser.parse_args()
 
-    # ── Homografia + Warp ──────────────────────────────────────────────────
-    print("\n  A calcular homografia e retificar imagem...")
-    img_ret, ppm, W_real, D_real = aplicar_homografia(img_undist, pts_img, pts_reais)
+    print("\n" + "═"*60)
+    print("  RETIFICADOR – Conversão Pixel → Coordenadas Reais")
+    print("═"*60)
 
-    # ── Guardar ────────────────────────────────────────────────────────────
-    caminho_saida = guardar_imagem(img_ret, caminho_img)
-    print(f"\n  ✓ Area retificada:   {W_real:.2f} m x {D_real:.2f} m")
-    print(f"  ✓ Resolucao saida:   {ppm:.0f} px/m")
-    print(f"  ✓ Dimensoes saida:   {img_ret.shape[1]} x {img_ret.shape[0]} px")
-    print(f"  ✓ Ficheiro guardado: {caminho_saida}")
+    if args.calibrar:
+        calib = calibrar_e_guardar()
+    else:
+        calib = carregar_calibracao()
 
-    # ── Mostrar ────────────────────────────────────────────────────────────
-    mostrar_imagem(img_ret)
+    servidor_retificacao(calib)
 
 
 if __name__ == "__main__":
