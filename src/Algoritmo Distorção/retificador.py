@@ -1,20 +1,3 @@
-"""
-retificador.py  –  Servidor de Retificação por Homografia
-==========================================================
-Fluxo geral:
-  1. Na primeira execução (ou via --calibrar), o utilizador calibra a homografia:
-       - Seleciona a câmara
-       - Abre uma imagem de referência
-       - Clica N pontos e introduz as coordenadas reais em metros
-       - A matriz H e os parâmetros são guardados em 'homografia_calibracao.json'
-  2. Em modo servidor (fluxo normal):
-       - Aguarda ligação do VisionProcessing via socket IPC (porta 6001)
-       - Recebe pacote { frame, bolas_px, indice, timestamp_visao }
-       - Aplica undistort + homografia a cada coordenada de bola
-       - Guarda coordenadas reais em JSON  →  Homografia/Coordenadas retificadas/
-       - Guarda imagem retificada          →  Homografia/Imagem Retificada/
-       - Envia "LIBERADO" de volta ao VisionProcessing
-"""
 
 import cv2
 import numpy as np
