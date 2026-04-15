@@ -1,80 +1,51 @@
-import os
 import time
-import json
-from pathlib import Path
 from ultralytics import YOLO
-from multiprocessing.connection import Listener
+from multiprocessing.connection import Listener, Client
+from pathlib import Path
 
-# --- CONFIGURACAO ---
-MODELO_PATH = Path(r"C:\Users\andre\OneDrive\Ambiente de Trabalho\FEUP\4º Ano - Mestrado\Projeto Integrador - UFSC\runs\detect\treino_bolas_v24\weights\best.pt")
-PATH_VALUES = Path(r"C:\Users\andre\OneDrive\Ambiente de Trabalho\FEUP\4º Ano - Mestrado\Projeto Integrador - UFSC\Coordinates\Values")
-PATH_IMAGES = Path(r"C:\Users\andre\OneDrive\Ambiente de Trabalho\FEUP\4º Ano - Mestrado\Projeto Integrador - UFSC\Coordinates\Images (para visualizaçao)")
+MODELO = Path(r"C:\Users\andre\OneDrive\Ambiente de Trabalho\FEUP\4º Ano - Mestrado\Projeto Integrador - UFSC\runs\detect\treino_bolas_v24\weights\best.pt")
 
-def processador_visao():
-    PATH_VALUES.mkdir(parents=True, exist_ok=True)
-    PATH_IMAGES.mkdir(parents=True, exist_ok=True)
-
-    print("[ETAPA] Carregando modelo YOLOv8 na GPU...")
-    model = YOLO(MODELO_PATH)
-
-    # Criar o "Porto" de escuta (Socket IPC)
-    address = ('localhost', 6000) 
-    listener = Listener(address, authkey=b'bolas_ufsc')
+def iniciar_visao():
+    print("[VISAO] Carregando Modelo...")
+    model = YOLO(MODELO)
     
-    print("[ETAPA] Mutex Binario Ativo: Servidor aguardando conexao direta...")
+    # Servidor na porta 6000
+    listener = Listener(('localhost', 6000), authkey=b'bolas_ufsc')
+    print("[VISAO] Aguardando dados na porta 6000...")
     
     indice = 0
     while True:
-        conn = listener.accept() # Bloqueia aqui ate o Streaming ligar
-        print(f"\n[ETAPA] Conexao estabelecida com o Script de Captura.")
-        
-        try:
-            # Receber o pacote de dados (Imagem + Timestamp)
+        with listener.accept() as conn:
             pacote = conn.recv()
-            tempo_captura = pacote['timestamp']
-            frame = pacote['frame']
-            nome_origem = pacote['nome']
-
-            print(f"[ETAPA] Imagem '{nome_origem}' recebida via Mutex/Socket.")
-
-            # Inferência YOLO
-            t_inicio_proc = time.time()
-            results = model.predict(source=frame, conf=0.5, device=0, verbose=False)
+            print(f"[PROCESSO] Analisando pacote {indice}...")
             
-            dados_bolas = []
+            results = model.predict(source=pacote['frame'], conf=0.5, device=0, verbose=False)
+            bolas = []
             for r in results:
-                boxes = r.boxes.xyxy.cpu().numpy()
-                for box in boxes:
-                    dados_bolas.append({"x1": int(box[0]), "y1": int(box[1]), "x2": int(box[2]), "y2": int(box[3])})
-                
-                # Guardar visualizacao
-                r.save(filename=str(PATH_IMAGES / f"visualizacao{indice}.jpg"))
-
-            # Calculo de Latencia de Ponta-a-Ponta
-            tempo_final = time.time()
-            latencia_ms = (tempo_final - tempo_captura) * 1000
-
-            # Salvar JSON final
-            nome_json = f"coordinates{indice}.json"
-            saida = {
-                "indice": indice,
-                "latencia_total_ms": round(latencia_ms, 2),
-                "bolas": dados_bolas
-            }
-            with open(PATH_VALUES / nome_json, 'w') as f:
-                json.dump(saida, f, indent=4)
-
-            print(f"[ETAPA] Processamento concluido. Latencia: {latencia_ms:.2f}ms")
+                for box in r.boxes.xyxy.cpu().numpy():
+                    bolas.append({"x1": int(box[0]), "y1": int(box[1]), "x2": int(box[2]), "y2": int(box[3])})
             
-            # Enviar sinal de "OK" de volta para libertar o Streaming
-            conn.send("LIBERADO")
+            # Enviar para o Retificador (6001)
+            try:
+                with Client(('localhost', 6001), authkey=b'retificador_ufsc') as c_ret:
+                    print("[VISAO] Passando para o Retificador...")
+                    c_ret.send({
+                        'frame': pacote['frame'], 
+                        'bolas_px': bolas, 
+                        'indice': indice, 
+                        'timestamp_visao': pacote['timestamp']
+                    })
+                    # Espera o Retificador acabar
+                    c_ret.recv()
+                
+                # Só agora responde ao capturador
+                conn.send("LIBERADO")
+                print(f"[SUCESSO] Pacote {indice} finalizado.")
+            except Exception as e:
+                print(f"[ERRO] O Retificador (6001) falhou: {e}")
+                conn.send("ERRO")
+            
             indice += 1
 
-        except Exception as e:
-            print(f"[ERRO] Falha no processamento: {e}")
-        finally:
-            conn.close()
-            print("[ESTADO] Mutex resetado. Aguardando proxima captura...")
-
 if __name__ == "__main__":
-    processador_visao()
+    iniciar_visao()
