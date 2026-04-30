@@ -1,421 +1,492 @@
 """
-VisionProcessing.py — Deteção de Bolas (YOLO) + Robô (ArUco) UFSC/FEUP
-========================================================================
-Servidor na porta 6000. Recebe frames do imageStreaming,
-executa inferência com o modelo YOLO personalizado para bolas,
-deteta marcadores ArUco para localização e orientação do robô,
-e encaminha os resultados para o retificador (porta 6001).
+MasterControl.py — Orquestrador Central UFSC/FEUP
+==================================================
+Pontos de entrada após arrancar:
+  [1] Iniciar produção
+  [2] Recalibrar (homografia)
+  [3] Configurar parâmetros
 
-Fluxo:
-  imageStreaming → [porta 6000] → VisionProcessing → [porta 6001] → retificador
-                                                                          ↓
-  imageStreaming ← [LIBERADO] ←────────────────────────────────────────────
+Argumentos de linha de comando:
+  --debug   Abre uma segunda consola onde aparecem todas as mensagens
+            de DEBUG dos módulos do pipeline. Sem este argumento, o
+            utilizador vê só mensagens humanas, eventos, avisos e erros.
 
-Marcadores ArUco:
-  ID 0 → Frente do robô  (DICT_4X4_50)
-  ID 1 → Traseira do robô (DICT_4X4_50)
-  A orientação é o ângulo do vector traseiro→frente (em graus, 0°=direita)
+Health-checks (cada módulo abre o seu numa porta dedicada):
+  6011  retificador
+  6002  VisionProcessing
+  6013  GraphProcessor
+  6014  RobotController
 
-NOTA: Uma thread separada fica à escuta na porta 6002 (PORTA_HEALTH)
-      exclusivamente para responder a health-checks do MasterControl.
+Portas autenticadas (não tocar sem authkey):
+  6000  VisionProcessing ↔ imageStreaming
+  6001  retificador      ↔ imageStreaming/calibração
+  6020  retificador       → GraphProcessor (fila de JSONs)
+  6021  GraphProcessor    → RobotController (broadcast de estado)
+  6030  consola de debug  ← qualquer módulo (TCP texto)
 """
 
-import cv2
-import numpy as np
-import time
-import sys
+import argparse
+import os
 import socket
-import threading
-from pathlib import Path
-from multiprocessing.connection import Listener, Client
+import subprocess
+import sys
+import time
 from datetime import datetime
+from pathlib import Path
+
+import parametros
+from bolas_log import log, pedir_input
 
 # ─────────────────────────────────────────────
 #  CONFIGURAÇÃO
 # ─────────────────────────────────────────────
-BASE_PATH = Path(__file__).parent.resolve()
+PYTHON_EXE = r"C:\Users\andre\venv_bolas\Scripts\python.exe"
+BASE_PATH  = Path(__file__).parent.resolve()
 
-MODELO_PATH = (BASE_PATH / "runs" / "detect" / "treino_bolas_v24"
-               / "weights" / "best.pt")
+CALIB_FILE          = BASE_PATH / "resultados" / "calibracao" / "homografia_calibracao.json"
+PASTA_CALIB_REF     = BASE_PATH / "resultados" / "calibracao"
 
-PORTA_ENTRADA  = 6000
-PORTA_HEALTH   = 6002
-PORTA_RET      = 6001
-AUTHKEY_VIS    = b"bolas_ufsc"
-AUTHKEY_RET    = b"retificador_ufsc"
+# Portas de health
+PORTA_RET_HEALTH      = 6011
+PORTA_VIS_HEALTH      = 6002
+PORTA_GRAFO_HEALTH    = 6013
+PORTA_CONTROL_HEALTH  = 6014
 
-CONFIANCA_MIN  = 0.50
-DISPOSITIVO    = 0             # 0=GPU CUDA, "cpu" para CPU
+# Portas autenticadas
+PORTA_VIS         = 6000
+PORTA_RET         = 6001
+PORTA_RET_GRAFO   = 6020
+PORTA_BROADCAST   = 6021
 
-# ── ArUco ─────────────────────────────────────
-ARUCO_DICT     = cv2.aruco.DICT_4X4_50
-ID_FRONTAL     = 0             # marcador rosa na frente do robô
-ID_TRASEIRO    = 1             # marcador roxo na traseira do robô
+# Consola de debug
+PORTA_DEBUG       = 6030
 
-# Pré-processamento CLAHE para robustez a luz frontal intensa
-CLAHE_CLIP     = 2.0
-CLAHE_GRID     = (8, 8)
+TIMEOUT_ARRANQUE = 60
+INTERVALO_POLL   = 0.5
+
+MOD = "MASTER"
+
 
 # ─────────────────────────────────────────────
-#  LOGGING
+#  ARGUMENTOS DE LINHA DE COMANDO
 # ─────────────────────────────────────────────
-ICONS = {"INFO": "·", "OK": "✓", "ERRO": "✗", "AVISO": "!", "FASE": "▶️"}
+parser = argparse.ArgumentParser(description="Orquestrador UFSC/FEUP")
+parser.add_argument("--debug", action="store_true",
+                    help="Ativa consola de debug separada (porta 6030)")
+ARGS = parser.parse_args()
 
-def log(nivel: str, msg: str):
-    ts   = datetime.now().strftime("%H:%M:%S")
-    icon = ICONS.get(nivel, "·")
-    cor  = {
-        "OK":    "\033[92m",
-        "ERRO":  "\033[91m",
-        "AVISO": "\033[93m",
-        "FASE":  "\033[96m",
-        "INFO":  "\033[0m",
-    }.get(nivel, "\033[0m")
-    print(f"{cor}[{ts}] [VISAO        ] {icon} {msg}\033[0m", flush=True)
+# Propaga aos filhos via variável de ambiente
+if ARGS.debug:
+    os.environ["BOLAS_DEBUG"] = "1"
+
 
 # ─────────────────────────────────────────────
-#  HEALTH-CHECK SERVER (porta 6002)
+#  AUXILIARES VISUAIS
 # ─────────────────────────────────────────────
-def iniciar_health_server(porta: int = PORTA_HEALTH):
-    def _serve():
-        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        try:
-            srv.bind(("localhost", porta))
-            srv.listen(5)
-            while True:
-                try:
-                    conn, _ = srv.accept()
-                    conn.close()
-                except Exception:
-                    pass
-        except Exception as e:
-            log("AVISO", f"Health-server falhou na porta {porta}: {e}")
-        finally:
-            srv.close()
+def separador(titulo: str = ""):
+    if titulo:
+        print(f"\033[1;96m{'─'*22} {titulo} {'─'*22}\033[0m", flush=True)
+    else:
+        print(f"\033[90m{'─'*70}\033[0m", flush=True)
 
-    t = threading.Thread(target=_serve, daemon=True)
-    t.start()
-    log("INFO", f"Health-check ativo na porta {porta}")
+
+def cabecalho_inicial():
+    os.system("cls")
+    print("\033[1;96m")
+    print("╔══════════════════════════════════════════════════════╗")
+    print("║       SISTEMA INTEGRADO UFSC/FEUP — Bolas v3         ║")
+    print("╚══════════════════════════════════════════════════════╝")
+    print("\033[0m")
+
 
 # ─────────────────────────────────────────────
-#  DETEÇÃO ARUCO
+#  CONSOLA DE DEBUG
 # ─────────────────────────────────────────────
-def criar_detetor_aruco():
-    """
-    Inicializa o detetor ArUco com parâmetros ajustados para maior
-    robustez em condições de iluminação variável.
-    """
-    dictionary  = cv2.aruco.getPredefinedDictionary(ARUCO_DICT)
-    parameters  = cv2.aruco.DetectorParameters()
+def lancar_consola_debug():
+    """Abre uma nova janela cmd.exe a correr debug_console.py."""
+    log(MOD, "HUMANO", "A abrir consola de debug em janela separada...")
+    log(MOD, "DEBUG",  f"PYTHON_EXE={PYTHON_EXE} | porta={PORTA_DEBUG}")
+    cmd = (
+        f'start "SISTEMA UFSC/FEUP — Debug" cmd /k '
+        f'chcp 65001 > nul ^&^& '
+        f'"{PYTHON_EXE}" "{BASE_PATH / "debug_console.py"}"'
+    )
+    try:
+        subprocess.Popen(cmd, shell=True)
+        time.sleep(1.5)
+        log(MOD, "HUMANO", "Consola de debug pronta.")
+    except Exception as e:
+        log(MOD, "ERRO", f"Não consegui abrir consola de debug: {e}")
 
-    # Mais tolerante a variações de contraste e perspetiva
-    parameters.adaptiveThreshWinSizeMin  = 3
-    parameters.adaptiveThreshWinSizeMax  = 53
-    parameters.adaptiveThreshWinSizeStep = 4
-    parameters.minMarkerPerimeterRate    = 0.02   # aceita marcadores mais distantes
-    parameters.maxMarkerPerimeterRate    = 4.0
-    parameters.polygonalApproxAccuracyRate = 0.05
-
-    detector = cv2.aruco.ArucoDetector(dictionary, parameters)
-    log("OK", f"Detetor ArUco iniciado (DICT_4X4_50 | ID_FRONTAL={ID_FRONTAL} ID_TRASEIRO={ID_TRASEIRO})")
-    return detector
-
-
-def detetar_robo(frame_gray, detector, clahe) -> dict:
-    """
-    Deteta os dois marcadores ArUco do robô num frame em grayscale.
-
-    Aplica CLAHE antes da deteção para compensar overexposure e
-    variações de iluminação (luz frontal, artificial, natural).
-
-    Devolve um dicionário com:
-      frontal  : {"cx", "cy"} em píxeis, ou None
-      traseiro : {"cx", "cy"} em píxeis, ou None
-      orientacao_graus : ângulo do vector traseiro→frontal, ou None
-                         (0° = direita, 90° = cima, sentido anti-horário)
-    """
-    resultado = {
-        "frontal":           None,
-        "traseiro":          None,
-        "orientacao_graus":  None,
-    }
-
-    # CLAHE equaliza contraste localmente — robusto a overexposure
-    frame_eq = clahe.apply(frame_gray)
-
-    corners, ids, _ = detector.detectMarkers(frame_eq)
-
-    if ids is None:
-        return resultado
-
-    ids_flat = ids.flatten()
-
-    for i, marker_id in enumerate(ids_flat):
-        # Centróide = média dos 4 cantos do marcador
-        cx = float(corners[i][0][:, 0].mean())
-        cy = float(corners[i][0][:, 1].mean())
-
-        if marker_id == ID_FRONTAL:
-            resultado["frontal"]  = {"cx": round(cx, 1), "cy": round(cy, 1)}
-        elif marker_id == ID_TRASEIRO:
-            resultado["traseiro"] = {"cx": round(cx, 1), "cy": round(cy, 1)}
-
-    # Calcula orientação apenas quando ambos os marcadores são visíveis
-    if resultado["frontal"] and resultado["traseiro"]:
-        dx = resultado["frontal"]["cx"]  - resultado["traseiro"]["cx"]
-        dy = resultado["frontal"]["cy"]  - resultado["traseiro"]["cy"]
-        # arctan2 em coordenadas de imagem (y cresce para baixo)
-        angulo = float(np.degrees(np.arctan2(-dy, dx)))  # -dy para eixo Y standard
-        resultado["orientacao_graus"] = round(angulo, 2)
-
-    return resultado
-
-
-def anotar_robo(frame, robo: dict):
-    COR_FRONTAL  = (255, 80,  220)   # rosa/magenta — frente
-    COR_TRASEIRO = (180, 0,   255)   # roxo          — traseira
-    COR_SETA     = (0,   255, 180)   # verde-azulado — orientação
-    RAIO_PONTO   = 10                # mesmo peso visual das bolas
-
-    for chave, cor, label in [
-        ("frontal",  COR_FRONTAL,  "FRENTE"),
-        ("traseiro", COR_TRASEIRO, "TRAS"),
-    ]:
-        pos = robo.get(chave)
-        if pos:
-            cx, cy = int(pos["cx"]), int(pos["cy"])
-
-            # Ponto cheio bem visível (igual ao estilo das bolas)
-            cv2.circle(frame, (cx, cy), RAIO_PONTO,     cor, -1)
-            # Anel branco por fora para contraste em qualquer fundo
-            cv2.circle(frame, (cx, cy), RAIO_PONTO + 2, (255, 255, 255), 2)
-
-            # Legenda com fundo escuro (igual às bolas)
-            (tw, th), _ = cv2.getTextSize(
-                label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
-            cv2.rectangle(frame,
-                          (cx + 14, cy - th - 6),
-                          (cx + 14 + tw + 4, cy + 2),
-                          cor, -1)
-            cv2.putText(frame, label,
-                        (cx + 16, cy - 4),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 2)
-
-    # Seta de orientação quando ambos estão visíveis
-    if robo["frontal"] and robo["traseiro"] and robo["orientacao_graus"] is not None:
-        fx, fy = int(robo["frontal"]["cx"]),  int(robo["frontal"]["cy"])
-        tx, ty = int(robo["traseiro"]["cx"]), int(robo["traseiro"]["cy"])
-        cv2.line(frame, (tx, ty), (fx, fy), COR_SETA, 2)
-        ang_rad = np.radians(robo["orientacao_graus"])
-        ex = int(fx + 35 * np.cos(ang_rad))
-        ey = int(fy - 35 * np.sin(ang_rad))
-        cv2.arrowedLine(frame, (fx, fy), (ex, ey), COR_SETA, 2, tipLength=0.35)
-        cv2.putText(frame, f"{robo['orientacao_graus']:.1f}deg",
-                    (tx + 5, ty + 20),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.50, COR_SETA, 1)
-
-    return frame
 
 # ─────────────────────────────────────────────
-#  ENVIO PARA RETIFICADOR (com retry)
+#  GESTÃO DE PORTAS E PROCESSOS
 # ─────────────────────────────────────────────
-def enviar_para_retificador(pacote_ret: dict, tentativas: int = 3) -> bool:
+def porta_aberta(porta: int) -> bool:
+    try:
+        with socket.create_connection(("localhost", porta), timeout=0.3):
+            return True
+    except OSError:
+        return False
+
+
+def aguardar_porta(porta: int, servico: str, timeout: int = TIMEOUT_ARRANQUE) -> bool:
+    log(MOD, "HUMANO", f"A aguardar arranque de '{servico}'...")
+    log(MOD, "DEBUG",  f"polling porta {porta} timeout={timeout}s")
+    tentativas = int(timeout / INTERVALO_POLL)
     for i in range(tentativas):
-        try:
-            with Client(("localhost", PORTA_RET), authkey=AUTHKEY_RET) as c:
-                c.send(pacote_ret)
-                resposta = c.recv()
-                return resposta == "LIBERADO"
-        except ConnectionRefusedError:
-            if i < tentativas - 1:
-                espera = 1.0 * (i + 1)
-                log("AVISO",
-                    f"Retificador não responde (tentativa {i+1}/{tentativas}). "
-                    f"A aguardar {espera:.0f}s...")
-                time.sleep(espera)
-            else:
-                log("ERRO", "Retificador inacessível após todas as tentativas.")
-        except Exception as e:
-            log("ERRO", f"Erro ao contactar retificador: {e}")
-            break
+        if porta_aberta(porta):
+            log(MOD, "HUMANO", f"'{servico}' pronto.")
+            log(MOD, "DEBUG",  f"porta {porta} respondeu após "
+                               f"{i*INTERVALO_POLL:.1f}s")
+            return True
+        if i > 0 and i % int(5 / INTERVALO_POLL) == 0:
+            log(MOD, "DEBUG", f"  ... ainda a aguardar '{servico}' "
+                              f"({int(i*INTERVALO_POLL)}s/{timeout}s)")
+        time.sleep(INTERVALO_POLL)
+    log(MOD, "ERRO", f"TIMEOUT: '{servico}' não respondeu em {timeout}s.")
+    log(MOD, "DEBUG", f"porta {porta} continua fechada após {timeout}s")
     return False
 
+
+def executar_modulo(script_name: str, args: list | None = None) -> subprocess.Popen:
+    cmd = [PYTHON_EXE, str(BASE_PATH / script_name)] + (args or [])
+    log(MOD, "DEBUG", f"a lançar: {' '.join(cmd)}")
+    return subprocess.Popen(cmd, env=os.environ.copy())
+
+
+def _pids_a_ocupar_portas(portas: list[int]) -> set[int]:
+    """
+    Devolve os PIDs (Windows) de processos que estão a fazer LISTEN nas
+    portas indicadas. Usa 'netstat -ano' e parseia a coluna PID.
+    """
+    pids: set[int] = set()
+    try:
+        out = subprocess.check_output(
+            ["netstat", "-ano", "-p", "TCP"],
+            stderr=subprocess.DEVNULL,
+            text=True,
+            errors="replace",
+        )
+    except Exception as e:
+        log(MOD, "DEBUG", f"netstat falhou: {e}")
+        return pids
+
+    for linha in out.splitlines():
+        partes = linha.split()
+        if len(partes) < 5:
+            continue
+        if "LISTENING" not in partes[3]:
+            continue
+        local = partes[1]
+        # local típico: "127.0.0.1:6011" ou "0.0.0.0:6011" ou "[::]:6011"
+        if ":" not in local:
+            continue
+        try:
+            porta = int(local.rsplit(":", 1)[1])
+        except ValueError:
+            continue
+        if porta in portas:
+            try:
+                pids.add(int(partes[4]))
+            except ValueError:
+                pass
+    return pids
+
+
+def matar_processos_pendentes():
+    """
+    Mata APENAS os processos Python que estão a ocupar portas conhecidas
+    do pipeline. NUNCA mata o próprio MasterControl, mesmo que ele
+    estivesse a ocupar uma das portas (que não está — só os filhos abrem
+    portas).
+    """
+    portas_alvo = [
+        PORTA_RET_HEALTH, PORTA_VIS_HEALTH,
+        PORTA_GRAFO_HEALTH, PORTA_CONTROL_HEALTH,
+        PORTA_VIS, PORTA_RET, PORTA_RET_GRAFO, PORTA_BROADCAST,
+        PORTA_DEBUG,
+    ]
+    log(MOD, "AVISO", "A verificar processos pendentes nas portas do pipeline...")
+    log(MOD, "DEBUG",  f"portas alvo: {portas_alvo}")
+
+    pid_master = os.getpid()
+    pids = _pids_a_ocupar_portas(portas_alvo)
+    pids.discard(pid_master)   # blindagem: nunca matar o próprio MasterControl
+
+    if not pids:
+        log(MOD, "HUMANO", "Não havia processos pendentes — tudo limpo.")
+        return
+
+    log(MOD, "DEBUG", f"PIDs a matar: {sorted(pids)} (Master={pid_master} blindado)")
+    for pid in pids:
+        ret = os.system(f"taskkill /f /pid {pid} /t >nul 2>&1")
+        log(MOD, "DEBUG", f"taskkill /pid {pid} → exit={ret}")
+    time.sleep(1.5)
+    log(MOD, "HUMANO", f"Processos pendentes encerrados ({len(pids)} no total).")
+
+
+def encerrar_pipeline(processos: list, motivo: str = "sinal do utilizador"):
+    separador("ENCERRAMENTO")
+    log(MOD, "AVISO", f"A encerrar pipeline ({motivo})...")
+    for p in processos:
+        if p and p.poll() is None:
+            log(MOD, "DEBUG", f"a terminar PID {p.pid}")
+            try:
+                p.terminate(); p.wait(timeout=3)
+            except Exception:
+                log(MOD, "DEBUG", f"terminate falhou, a forçar kill no PID {p.pid}")
+                p.kill()
+    log(MOD, "HUMANO", "Pipeline encerrado. Até à próxima!")
+    sys.exit(0)
+
+
 # ─────────────────────────────────────────────
-#  SERVIDOR PRINCIPAL
+#  FASE 1 — CALIBRAÇÃO DINÂMICA
 # ─────────────────────────────────────────────
-def iniciar_visao():
-    # ── Carregar modelo YOLO ───────────────────────────────
-    log("FASE", "Carregando modelo YOLO...")
-    if not MODELO_PATH.exists():
-        log("ERRO", f"Modelo não encontrado: {MODELO_PATH}")
-        sys.exit(1)
+def fase_calibracao() -> bool:
+    separador("FASE 1 — CALIBRAÇÃO DINÂMICA")
+
+    if porta_aberta(PORTA_RET_HEALTH):
+        log(MOD, "AVISO", "Porta de health do retificador já ocupada. A limpar...")
+        matar_processos_pendentes()
+
+    log(MOD, "HUMANO", "A iniciar servidor de calibração...")
+    p_ret = executar_modulo("retificador.py", ["--calibrar"])
+
+    if not aguardar_porta(PORTA_RET_HEALTH, "retificador (calib)", timeout=30):
+        log(MOD, "ERRO", "Retificador de calibração não arrancou. A abortar.")
+        p_ret.terminate()
+        return False
+
+    log(MOD, "HUMANO", "A lançar câmara para captura do frame de referência...")
+    p_cap = executar_modulo("imageStreaming.py", ["--modo", "calibracao"])
+
+    log(MOD, "HUMANO", "Captura um frame com a tecla 'C' e marca os pontos na janela.")
+    log(MOD, "HUMANO", "O sistema avança automaticamente quando a calibração for guardada.")
+
+    p_ret.wait()
+    p_cap.terminate()
+
+    if CALIB_FILE.exists():
+        log(MOD, "HUMANO", f"Calibração guardada com sucesso!")
+        log(MOD, "DEBUG",  f"ficheiro: {CALIB_FILE}")
+        return True
+    else:
+        log(MOD, "ERRO", "Ficheiro de calibração não foi criado. Verifica os pontos.")
+        return False
+
+
+# ─────────────────────────────────────────────
+#  FASE 2 — PRODUÇÃO
+# ─────────────────────────────────────────────
+def fase_producao():
+    separador("FASE 2 — PIPELINE DE PRODUÇÃO")
+
+    if (porta_aberta(PORTA_RET_HEALTH) or porta_aberta(PORTA_VIS_HEALTH)
+        or porta_aberta(PORTA_GRAFO_HEALTH) or porta_aberta(PORTA_CONTROL_HEALTH)):
+        log(MOD, "AVISO", "Portas já ocupadas. A matar processos pendentes...")
+        matar_processos_pendentes()
+
+    processos: list[subprocess.Popen] = []
+
+    log(MOD, "HUMANO", "A lançar retificador...")
+    log(MOD, "DEBUG",  "health=6011 | sockets autenticados=6001 (calib) e 6020 (grafo)")
+    p_ret = executar_modulo("retificador.py")
+    processos.append(p_ret)
+    if not aguardar_porta(PORTA_RET_HEALTH, "retificador"):
+        encerrar_pipeline(processos, "retificador não respondeu")
+
+    log(MOD, "HUMANO", "A lançar processamento de visão...")
+    log(MOD, "DEBUG",  "health=6002 | socket autenticado=6000")
+    p_vis = executar_modulo("VisionProcessing.py")
+    processos.append(p_vis)
+    if not aguardar_porta(PORTA_VIS_HEALTH, "VisionProcessing"):
+        encerrar_pipeline(processos, "VisionProcessing não respondeu")
+
+    log(MOD, "HUMANO", "A lançar GraphProcessor...")
+    log(MOD, "DEBUG",  "health=6013 | cliente de 6020 | broadcaster em 6021")
+    p_grafo = executar_modulo("GraphProcessor.py")
+    processos.append(p_grafo)
+    if not aguardar_porta(PORTA_GRAFO_HEALTH, "GraphProcessor"):
+        encerrar_pipeline(processos, "GraphProcessor não respondeu")
+
+    log(MOD, "HUMANO", "A lançar controlador do robô...")
+    log(MOD, "DEBUG",  "health=6014 | cliente de 6021")
+    p_ctrl = executar_modulo("RobotController.py")
+    processos.append(p_ctrl)
+    if not aguardar_porta(PORTA_CONTROL_HEALTH, "RobotController"):
+        encerrar_pipeline(processos, "RobotController não respondeu")
+
+    separador()
+    log(MOD, "HUMANO", "Pipeline ativo!")
+    log(MOD, "HUMANO", "Tecla P → pausar  |  E → encerrar  |  I → info no terminal")
+    separador()
 
     try:
-        from ultralytics import YOLO
-        t0    = time.time()
-        model = YOLO(str(MODELO_PATH))
-        dummy = np.zeros((640, 640, 3), dtype=np.uint8)
-        model.predict(source=dummy, conf=CONFIANCA_MIN,
-                      device=DISPOSITIVO, verbose=False)
-        t_load = time.time() - t0
-        log("OK", f"Modelo carregado em {t_load:.1f}s | dispositivo={DISPOSITIVO}")
-    except Exception as e:
-        log("ERRO", f"Falha ao carregar YOLO: {e}")
-        sys.exit(1)
+        subprocess.run([PYTHON_EXE, str(BASE_PATH / "imageStreaming.py"),
+                        "--modo", "producao"], env=os.environ.copy())
+    except KeyboardInterrupt:
+        pass
+    finally:
+        encerrar_pipeline(processos, "imageStreaming encerrado")
 
-    # ── Inicializar detetor ArUco + CLAHE ──────────────────
-    aruco_detector = criar_detetor_aruco()
-    clahe          = cv2.createCLAHE(clipLimit=CLAHE_CLIP, tileGridSize=CLAHE_GRID)
 
-    # ── Health-server ──────────────────────────────────────
-    iniciar_health_server()
+# ─────────────────────────────────────────────
+#  CONFIGURAÇÃO DE PARÂMETROS
+# ─────────────────────────────────────────────
+def menu_parametros():
+    separador("CONFIGURAR PARÂMETROS")
+    cfg = parametros.carregar()
+    log(MOD, "HUMANO", f"Ficheiro: {parametros.FICH_PARAMS}")
+    log(MOD, "HUMANO", f"Total de {len(parametros.ESQUEMA)} parâmetros configuráveis.")
 
-    # ── Estatísticas de sessão ─────────────────────────────
-    stats = {
-        "frames":        0,
-        "bolas_total":   0,
-        "robo_detetado": 0,
-        "latencia_soma": 0.0,
-        "erros":         0,
-    }
+    while True:
+        print()
+        cat_atual = None
+        for i, entry in enumerate(parametros.ESQUEMA, 1):
+            if entry["categoria"] != cat_atual:
+                cat_atual = entry["categoria"]
+                print(f"\n  \033[1;96m── {cat_atual} ──\033[0m")
+            valor_fmt = parametros.formatar_valor(entry, cfg)
+            print(f"  \033[90m[{i:2d}]\033[0m  "
+                  f"{entry['chave']:26s}  "
+                  f"\033[1;92m{valor_fmt:18s}\033[0m  "
+                  f"\033[90m{entry['descricao']}\033[0m")
+        print()
 
-    log("FASE", f"Servidor ativo na porta {PORTA_ENTRADA}. Aguardando frames...")
+        resp = pedir_input(MOD,
+            "Número do parâmetro a editar (ou 'g' guardar e sair, 'c' cancelar):")
 
-    address = ("localhost", PORTA_ENTRADA)
-    with Listener(address, authkey=AUTHKEY_VIS) as listener:
-        while True:
-            try:
-                conn = listener.accept()
-            except ConnectionAbortedError:
-                log("AVISO", "Ligação rejeitada (sem autenticação) — a ignorar.")
-                continue
-            except Exception as e:
-                log("ERRO", f"Erro ao aceitar ligação: {e}")
-                continue
+        if resp.lower() == "c":
+            log(MOD, "AVISO", "Configuração cancelada — alterações não guardadas.")
+            return
+        if resp.lower() == "g":
+            parametros.guardar(cfg)
+            log(MOD, "HUMANO", "Parâmetros guardados.")
+            log(MOD, "DEBUG",  f"escrito em {parametros.FICH_PARAMS}")
+            return
 
-            with conn:
+        try:
+            idx = int(resp) - 1
+            if not (0 <= idx < len(parametros.ESQUEMA)):
+                raise ValueError
+        except ValueError:
+            log(MOD, "AVISO", f"Entrada inválida: '{resp}'. Tenta de novo.")
+            continue
+
+        entry = parametros.ESQUEMA[idx]
+        valor_atual = parametros.formatar_valor(entry, cfg)
+        intervalo   = parametros.formatar_intervalo(entry)
+
+        print()
+        print(f"  \033[1;96m{entry['chave']}\033[0m  ({entry['categoria']})")
+        print(f"  {entry['descricao']}")
+        print(f"  Valor atual:       \033[1;92m{valor_atual}\033[0m")
+        print(f"  Intervalo válido:  {intervalo}")
+        novo = pedir_input(MOD, "Novo valor (ENTER mantém atual):")
+
+        if not novo:
+            log(MOD, "DEBUG", f"sem alteração em '{entry['chave']}'")
+            continue
+
+        ok, valor_conv, erro = parametros.validar_valor(entry, novo)
+        if not ok:
+            log(MOD, "AVISO", f"Valor rejeitado: {erro}")
+            continue
+
+        cfg[entry["chave"]] = valor_conv
+        log(MOD, "HUMANO",
+            f"'{entry['chave']}' alterado para "
+            f"{parametros.formatar_valor(entry, cfg)}")
+
+
+# ─────────────────────────────────────────────
+#  MENU PRINCIPAL
+# ─────────────────────────────────────────────
+def menu_principal():
+    while True:
+        # Estado da calibração
+        fichs_calib = (list(PASTA_CALIB_REF.glob("homografia*.json"))
+                       if PASTA_CALIB_REF.exists() else [])
+        tem_calib = bool(fichs_calib)
+
+        if tem_calib:
+            log(MOD, "HUMANO", f"Calibração existente: {CALIB_FILE.name}")
+            log(MOD, "DEBUG",  f"{len(fichs_calib)} ficheiro(s) na pasta de calibração")
+        else:
+            log(MOD, "AVISO",
+                "Nenhuma calibração encontrada. Será obrigatória antes da produção.")
+
+        # Carregar parâmetros (cria com defaults se não existir)
+        cfg = parametros.carregar()
+        log(MOD, "DEBUG", f"parametros.json com {len(cfg)} chave(s) carregadas")
+
+        separador()
+        print()
+        print("  \033[1;96m[1]\033[0m  Iniciar produção")
+        print("  \033[1;96m[2]\033[0m  Recalibrar (homografia)")
+        print("  \033[1;96m[3]\033[0m  Configurar parâmetros")
+        print("  \033[1;96m[4]\033[0m  Sair")
+        print()
+        resp = pedir_input(MOD, "Escolhe uma opção [1-4]:")
+
+        if resp == "1":
+            if not tem_calib:
+                log(MOD, "AVISO",
+                    "Não há calibração. A iniciar calibração obrigatória primeiro.")
+                if not fase_calibracao():
+                    log(MOD, "ERRO", "Calibração falhou. A voltar ao menu.")
+                    continue
+            fase_producao()
+            return
+
+        elif resp == "2":
+            if tem_calib:
+                conf = pedir_input(MOD,
+                    "Tens a certeza? Calibração antiga será apagada (s/N):")
+                if conf.lower() != "s":
+                    log(MOD, "DEBUG", "recalibração cancelada pelo utilizador")
+                    continue
                 try:
-                    pacote = conn.recv()
-                    indice = stats["frames"]
-                    t_recv = time.time()
-                    frame  = pacote["frame"]
+                    CALIB_FILE.unlink()
+                    log(MOD, "HUMANO", "Calibração anterior removida.")
+                    log(MOD, "DEBUG",  f"unlink {CALIB_FILE}")
+                except PermissionError:
+                    log(MOD, "AVISO",
+                        "Não consegui apagar — a matar processos pendentes...")
+                    matar_processos_pendentes()
+                    CALIB_FILE.unlink()
+            if fase_calibracao():
+                input("\033[1;92m  Calibração concluída! "
+                      "Prima ENTER para voltar ao menu...\033[0m")
 
-                    # ── Inferência YOLO (bolas) ────────────
-                    t_inf = time.time()
-                    results = model.predict(
-                        source=frame,
-                        conf=CONFIANCA_MIN,
-                        device=DISPOSITIVO,
-                        verbose=False,
-                    )
-                    ms_yolo = (time.time() - t_inf) * 1000
+        elif resp == "3":
+            menu_parametros()
 
-                    bolas = []
-                    for r in results:
-                        boxes_xyxy = r.boxes.xyxy.cpu().numpy()
-                        boxes_conf = r.boxes.conf.cpu().numpy() if hasattr(r.boxes, "conf") else []
-                        for idx_b, box in enumerate(boxes_xyxy):
-                            conf = float(boxes_conf[idx_b]) if len(boxes_conf) > idx_b else 0.0
-                            bolas.append({
-                                "x1": int(box[0]), "y1": int(box[1]),
-                                "x2": int(box[2]), "y2": int(box[3]),
-                                "conf": round(conf, 3),
-                            })
+        elif resp == "4":
+            log(MOD, "HUMANO", "Até à próxima!")
+            sys.exit(0)
 
-                    # ── Deteção ArUco (robô) ───────────────
-                    t_aruco = time.time()
-                    gray    = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                    robo    = detetar_robo(gray, aruco_detector, clahe)
-                    ms_aruco = (time.time() - t_aruco) * 1000
+        else:
+            log(MOD, "AVISO", f"Opção inválida: '{resp}'")
 
-                    # ── Log resumido ───────────────────────
-                    robo_str = "—"
-                    if robo["frontal"] or robo["traseiro"]:
-                        partes = []
-                        if robo["frontal"]:
-                            partes.append("F✓")
-                        if robo["traseiro"]:
-                            partes.append("T✓")
-                        if robo["orientacao_graus"] is not None:
-                            partes.append(f"{robo['orientacao_graus']:.1f}°")
-                        robo_str = " ".join(partes)
-                        stats["robo_detetado"] += 1
-
-                    log("INFO",
-                        f"Frame {indice:04d} | bolas={len(bolas)} "
-                        f"[{ms_yolo:.0f}ms] | robô={robo_str} [{ms_aruco:.0f}ms]")
-
-                    # ── Anotar frame ───────────────────────
-                    frame_anotado = frame.copy()
-
-                    # Bolas
-                    for idx_b, b in enumerate(bolas):
-                        cv2.rectangle(frame_anotado,
-                                      (b["x1"], b["y1"]), (b["x2"], b["y2"]),
-                                      (0, 255, 0), 2)
-                        label = f"bola {idx_b+1}  {b['conf']:.2f}"
-                        (tw, th), _ = cv2.getTextSize(
-                            label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
-                        ty = max(b["y1"] - 8, th + 4)
-                        cv2.rectangle(frame_anotado,
-                                      (b["x1"], ty - th - 4),
-                                      (b["x1"] + tw + 4, ty + 2),
-                                      (0, 255, 0), -1)
-                        cv2.putText(frame_anotado, label,
-                                    (b["x1"] + 2, ty),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
-
-                    # Robô
-                    frame_anotado = anotar_robo(frame_anotado, robo)
-
-                    # ── Encaminhar para retificador ────────
-                    # Envia sempre (mesmo sem bolas) para que o retificador
-                    # possa registar a posição do robô.
-                    pacote_ret = {
-                        "frame":           frame_anotado,
-                        "bolas_px":        bolas,
-                        "robo_px":         robo,          # NOVO: posição ArUco
-                        "indice":          indice,
-                        "timestamp_visao": pacote["timestamp"],
-                    }
-
-                    tem_dados = bolas or robo["frontal"] or robo["traseiro"]
-                    if tem_dados:
-                        ok = enviar_para_retificador(pacote_ret)
-                        if ok:
-                            log("OK", f"Frame {indice:04d} retificado com sucesso.")
-                        else:
-                            log("AVISO", f"Frame {indice:04d}: retificação falhou.")
-                    else:
-                        log("INFO", f"Frame {indice:04d}: sem bolas nem robô — a ignorar.")
-
-                    conn.send("LIBERADO")
-
-                    # ── Estatísticas ───────────────────────
-                    stats["frames"]       += 1
-                    stats["bolas_total"]  += len(bolas)
-                    ms_total = (time.time() - t_recv) * 1000
-                    stats["latencia_soma"] += ms_total
-
-                    if stats["frames"] % 10 == 0:
-                        media_lat = stats["latencia_soma"] / stats["frames"]
-                        log("INFO",
-                            f"─── Resumo {stats['frames']} frames | "
-                            f"bolas={stats['bolas_total']} | "
-                            f"robô detetado={stats['robo_detetado']}x | "
-                            f"latência média={media_lat:.0f}ms ───")
-
-                except Exception as e:
-                    log("ERRO", f"Erro ao processar frame: {e}")
-                    stats["erros"] += 1
-                    try:
-                        conn.send("LIBERADO")
-                    except Exception:
-                        pass
 
 # ─────────────────────────────────────────────
 #  PONTO DE ENTRADA
 # ─────────────────────────────────────────────
+def main():
+    cabecalho_inicial()
+    log(MOD, "HUMANO", f"Pasta do projeto: {BASE_PATH.name}")
+    log(MOD, "DEBUG",  f"BASE_PATH={BASE_PATH}")
+    log(MOD, "DEBUG",  f"PYTHON_EXE={PYTHON_EXE}")
+    log(MOD, "DEBUG",  f"BOLAS_DEBUG={'1' if ARGS.debug else '0'}")
+
+    if ARGS.debug:
+        lancar_consola_debug()
+
+    menu_principal()
+
+
 if __name__ == "__main__":
-    iniciar_visao()
+    main()

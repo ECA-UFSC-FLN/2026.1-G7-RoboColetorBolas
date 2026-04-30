@@ -7,8 +7,12 @@ Dois modos de operação detectados automaticamente:
     → Preview em tempo real; tecla C captura e envia UM frame para calibração.
 
   PRODUÇÃO    (VisionProcessing online na 6000)
-    → Loop automático: captura contínua e envia cada frame sem intervenção.
+    → Loop automático: captura contínua e envia cada frame.
       Tecla P pausa/retoma | Tecla E encerra.
+
+      O ritmo é ditado pelo VisionProcessing — o cliente só envia o
+      próximo frame quando o anterior já foi processado (handshake
+      "LIBERADO"). Sem timers artificiais.
 
 Teclas universais:
   E / ESC — Encerrar
@@ -23,11 +27,10 @@ import ctypes
 from datetime import datetime
 from multiprocessing.connection import Client
 
-# Suprime warnings internos do OpenCV (VIDEOIO, obsensor, etc.)
+# Suprime warnings internos do OpenCV
 os.environ["OPENCV_LOG_LEVEL"] = "SILENT"
 os.environ["OPENCV_VIDEOIO_DEBUG"] = "0"
 try:
-    # Redireciona stderr a nível de SO para suprimir mensagens do C++ do OpenCV
     if sys.platform == "win32":
         ctypes.windll.kernel32.SetErrorMode(0x8007)
 except Exception:
@@ -44,30 +47,22 @@ AUTHKEY_VIS     = b"bolas_ufsc"
 AUTHKEY_RET     = b"retificador_ufsc"
 MAX_TENTATIVAS  = 3
 
-# Intervalo mínimo entre capturas em produção (segundos).
-INTERVALO_PRODUCAO = 5.0
-
 # ─────────────────────────────────────────────
 #  LOGGING
 # ─────────────────────────────────────────────
-ICONS = {"INFO": "·", "OK": "✓", "ERRO": "✗", "AVISO": "!", "FASE": "▶️"}
+from bolas_log import log as _log
+
+MOD = "STREAMING"
 
 def log(nivel: str, msg: str):
-    ts   = datetime.now().strftime("%H:%M:%S")
-    icon = ICONS.get(nivel, "·")
-    cor  = {
-        "OK":    "\033[92m",
-        "ERRO":  "\033[91m",
-        "AVISO": "\033[93m",
-        "FASE":  "\033[96m",
-        "INFO":  "\033[0m",
-    }.get(nivel, "\033[0m")
-    print(f"{cor}[{ts}] [STREAMING   ] {icon} {msg}\033[0m", flush=True)
+    """Atalho local: encapsula bolas_log.log com o módulo fixo."""
+    _log(MOD, nivel, msg)
 
 
+# ─────────────────────────────────────────────
 #  ENVIO PARA VISÃO (produção)
 # ─────────────────────────────────────────────
-def enviar_para_visao(frame, dispositivo: str) -> bool:
+def enviar_para_visao(frame, dispositivo: str):
     """
     Envia frame para VisionProcessing (porta 6000) e aguarda LIBERADO.
     Devolve True se bem-sucedido, False em erro recuperável, None para terminar.
@@ -84,7 +79,7 @@ def enviar_para_visao(frame, dispositivo: str) -> bool:
                 return resposta == "LIBERADO"
         except ConnectionRefusedError:
             log("ERRO", "VisionProcessing desligou. A encerrar loop de produção.")
-            return None   # sinal para terminar o loop
+            return None
         except EOFError:
             if tentativa < MAX_TENTATIVAS - 1:
                 log("AVISO", f"Ligação interrompida (tentativa {tentativa+1}/{MAX_TENTATIVAS}). A repetir...")
@@ -94,19 +89,16 @@ def enviar_para_visao(frame, dispositivo: str) -> bool:
             return False
     return False
 
+
 # ─────────────────────────────────────────────
 #  ENVIO PARA CALIBRAÇÃO
 # ─────────────────────────────────────────────
 def enviar_para_calibracao(frame) -> bool:
-    """
-    Envia frame para retificador em modo calibração (porta 6001).
-    Devolve True se bem-sucedido.
-    """
     try:
         with Client(("localhost", PORTA_RET), authkey=AUTHKEY_RET) as conn:
-            log("INFO", f"Enviando frame de calibração para porta {PORTA_RET}...")
+            log("DEBUG", f"Enviando frame de calibração para porta {PORTA_RET}...")
             conn.send({"frame": frame})
-            log("OK", "Frame de calibração enviado.")
+            log("HUMANO", "Frame de calibração enviado.")
             return True
     except ConnectionRefusedError:
         log("ERRO", "Retificador (calibração) não está disponível na porta 6001.")
@@ -114,6 +106,7 @@ def enviar_para_calibracao(frame) -> bool:
     except Exception as e:
         log("ERRO", f"Erro ao enviar para calibração: {e}")
         return False
+
 
 # ─────────────────────────────────────────────
 #  OVERLAY
@@ -142,18 +135,13 @@ def desenhar_overlay(frame, stats: dict, modo: str, pausado: bool):
 
     info = (f"Enviados: {stats['enviados']}  |  "
             f"Erros: {stats['erros']}  |  "
-            f"FPS: {stats.get('fps', 0.0):.1f}")
+            f"FPS captura: {stats.get('fps', 0.0):.1f}  |  "
+            f"FPS envio: {stats.get('fps_envio', 0.0):.2f}")
     cv2.putText(frame, info,
-                (w // 2, 45), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (180, 220, 180), 1)
-
-    # Countdown até próxima captura
-    espera = stats.get("espera_restante", 0.0)
-    if modo == "PRODUCAO" and not pausado and espera > 0:
-        countdown_txt = f"Próxima captura em: {espera:.1f}s"
-        cv2.putText(frame, countdown_txt,
-                    (w // 2 - 10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (0, 200, 255), 1)
+                (w // 2 - 100, 45), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (180, 220, 180), 1)
 
     return frame
+
 
 # ─────────────────────────────────────────────
 #  LOOP PRINCIPAL
@@ -170,12 +158,12 @@ def stream():
             for backend, nome in BACKENDS:
                 c = cv2.VideoCapture(idx, backend)
                 if c.isOpened():
-                    log("OK", f"Câmera encontrada: índice={idx} backend={nome}")
+                    log("DEBUG", f"Câmera encontrada: índice={idx} backend={nome}")
                     return c
                 c.release()
         return None
 
-    log("FASE", "Procurando câmera disponível (índices 0–4, todos os backends)...")
+    log("DEBUG", "Procurando câmera disponível (índices 0–4, todos os backends)...")
     cap = tentar_abrir_camera()
 
     if cap is None:
@@ -190,29 +178,30 @@ def stream():
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
     w_real = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     h_real = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    log("OK", f"Câmera ativa: {w_real}×{h_real}px")
+    log("HUMANO", f"Câmara pronta ({w_real}×{h_real}px).")
 
-    # Modo recebido via argumento --modo (definido pelo MasterControl)
     modo = "CALIBRACAO"
     for i, arg in enumerate(sys.argv[1:], 1):
         if arg == "--modo" and i < len(sys.argv):
             modo = sys.argv[i + 1].upper()
             break
 
-    log("FASE", f"Modo: {modo}")
+    log("DEBUG", f"Modo: {modo}")
     if modo == "PRODUCAO":
-        log("INFO", "Captura automática contínua. Tecla P → pausa/retoma | Tecla E → encerrar")
+        log("HUMANO", "Captura em produção iniciada.")
+        log("HUMANO", "Tecla P → pausa/retoma  |  Tecla E → encerrar")
     else:
-        log("INFO", "Modo calibração — prima C para capturar o frame de referência.")
+        log("HUMANO", "Modo calibração — prima C na janela para capturar o frame.")
 
     cv2.namedWindow("Monitor de Captura", cv2.WINDOW_NORMAL)
     cv2.resizeWindow("Monitor de Captura", min(w_real, 1280), min(h_real, 720))
 
-    stats   = {"enviados": 0, "erros": 0, "fps": 0.0, "espera_restante": 0.0}
+    stats   = {"enviados": 0, "erros": 0, "fps": 0.0, "fps_envio": 0.0}
     pausado = False
     t_fps   = time.time()
     frames_fps = 0
-    t_proximo_envio = 0.0   # timestamp a partir do qual é permitido enviar
+    t_envios = time.time()
+    envios_janela = 0
 
     while True:
         ret, frame = cap.read()
@@ -221,7 +210,7 @@ def stream():
             time.sleep(0.1)
             continue
 
-        # Cálculo de FPS
+        # FPS de captura
         frames_fps += 1
         dt = time.time() - t_fps
         if dt >= 1.0:
@@ -229,71 +218,67 @@ def stream():
             frames_fps   = 0
             t_fps        = time.time()
 
-        # Preview
+        # FPS de envio (rolling 5s)
+        dt_e = time.time() - t_envios
+        if dt_e >= 5.0:
+            stats["fps_envio"] = envios_janela / dt_e
+            envios_janela = 0
+            t_envios = time.time()
+
         preview = desenhar_overlay(frame.copy(), stats, modo, pausado)
         cv2.imshow("Monitor de Captura", preview)
 
         tecla = cv2.waitKey(1) & 0xFF
 
-        # ── Encerrar ──────────────────────────────────────
         if tecla in (ord("e"), ord("E"), 27):
-            log("FASE", "A encerrar streaming...")
+            log("HUMANO", "A encerrar streaming...")
             break
 
-        # ── Info ──────────────────────────────────────────
         if tecla in (ord("i"), ord("I")):
-            log("INFO", f"Modo={modo} | Câmera={w_real}×{h_real}px | "
+            log("DEBUG", f"Modo={modo} | Câmera={w_real}×{h_real}px | "
                         f"Enviados={stats['enviados']} | Erros={stats['erros']} | "
-                        f"FPS={stats['fps']:.1f}")
+                        f"FPS captura={stats['fps']:.1f} | FPS envio={stats['fps_envio']:.2f}")
 
         # ══════════════════════════════════════════════════
         #  MODO CALIBRAÇÃO — tecla C captura e envia
         # ══════════════════════════════════════════════════
         if modo == "CALIBRACAO":
             if tecla in (ord("c"), ord("C")):
-                log("FASE", "A capturar frame de calibração...")
+                log("HUMANO", "A capturar frame de calibração...")
                 ok = enviar_para_calibracao(frame.copy())
                 if ok:
                     stats["enviados"] += 1
-                    log("OK", "Frame enviado. O retificador abrirá a janela de marcação.")
-                    log("INFO", "Este processo pode encerrar — o retificador toma conta do resto.")
-                    break   # imageStreaming já não é necessário após enviar
+                    log("HUMANO", "Frame enviado. O retificador abrirá a janela de marcação.")
+                    log("HUMANO", "Este processo pode encerrar — o retificador toma conta do resto.")
+                    break
                 else:
                     stats["erros"] += 1
 
         # ══════════════════════════════════════════════════
-        #  MODO PRODUÇÃO — loop automático
+        #  MODO PRODUÇÃO — captura contínua, sem timer
         # ══════════════════════════════════════════════════
         else:
             if tecla in (ord("p"), ord("P")):
                 pausado = not pausado
-                log("INFO", f"{'Pausado' if pausado else 'Retomado'}.")
+                log("HUMANO", f"{'Pausado' if pausado else 'Retomado'}.")
 
             if not pausado:
-                agora = time.time()
-                espera = t_proximo_envio - agora
-                stats["espera_restante"] = max(0.0, espera)
+                resultado = enviar_para_visao(frame.copy(), "cam_principal")
 
-                if agora >= t_proximo_envio:
-                    resultado = enviar_para_visao(frame.copy(), "cam_principal")
-
-                    if resultado is None:
-                        log("AVISO", "VisionProcessing indisponível. A encerrar.")
-                        break
-                    elif resultado:
-                        stats["enviados"] += 1
-                        t_proximo_envio = time.time() + INTERVALO_PRODUCAO
-                        log("INFO", f"Próxima captura em {INTERVALO_PRODUCAO:.0f}s.")
-                    else:
-                        stats["erros"] += 1
+                if resultado is None:
+                    log("AVISO", "VisionProcessing indisponível. A encerrar.")
+                    break
+                elif resultado:
+                    stats["enviados"] += 1
+                    envios_janela += 1
+                else:
+                    stats["erros"] += 1
 
     cap.release()
     cv2.destroyAllWindows()
-    log("OK", f"Streaming encerrado. "
+    log("HUMANO", f"Streaming encerrado. "
               f"Enviados={stats['enviados']} | Erros={stats['erros']}")
 
-# ─────────────────────────────────────────────
-#  PONTO DE ENTRADA
-# ─────────────────────────────────────────────
+
 if __name__ == "__main__":
     stream()
