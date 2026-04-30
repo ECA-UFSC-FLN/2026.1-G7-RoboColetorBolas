@@ -6,9 +6,18 @@ import argparse
 import time
 import socket
 import threading
+import queue
 from pathlib import Path
 from multiprocessing.connection import Listener
 from datetime import datetime
+
+from bolas_log import log as _log
+
+MOD = "RETIFICADOR"
+
+def log(nivel: str, msg: str):
+    """Atalho local: encapsula bolas_log.log com o módulo fixo."""
+    _log(MOD, nivel, msg)
 
 # ─────────────────────────────────────────────
 #  CONFIGURAÇÃO
@@ -22,7 +31,9 @@ PASTA_CALIB_REF   = PASTA_SAIDA / "calibracao"   # pontos + imagem de cada calib
 CALIB_FILE       = PASTA_CALIB_REF / "homografia_calibracao.json"
 PORTA        = 6001
 PORTA_HEALTH = 6011
+PORTA_GRAFO  = 6020                              # NOVO — fila para o GraphProcessor
 AUTHKEY      = b"retificador_ufsc"
+AUTHKEY_GRAFO = b"grafo_ufsc"                    # NOVO
 
 # Parâmetros intrínsecos iPhone 16 (landscape, 4032×3024)
 K_CAM = np.array([[5823,    0, 2016],
@@ -31,21 +42,12 @@ K_CAM = np.array([[5823,    0, 2016],
 D_CAM = np.array([0.122, -0.246, 0.0001, -0.0002, 0.176], dtype=np.float64)
 
 # ─────────────────────────────────────────────
-#  LOGGING
+#  FILA PARA O GRAPH PROCESSOR
 # ─────────────────────────────────────────────
-ICONS = {"INFO": "·", "OK": "✓", "ERRO": "✗", "AVISO": "!", "FASE": "▶️"}
+# Fila em memória de JSONs prontos. O servidor da porta 6020 consome desta fila.
+# Limite alto para não rebentar memória mas não bloquear o produtor em rajadas.
+_fila_grafo: queue.Queue = queue.Queue(maxsize=500)
 
-def log(nivel: str, msg: str):
-    ts   = datetime.now().strftime("%H:%M:%S")
-    icon = ICONS.get(nivel, "·")
-    cor  = {
-        "OK":    "\033[92m",
-        "ERRO":  "\033[91m",
-        "AVISO": "\033[93m",
-        "FASE":  "\033[96m",
-        "INFO":  "\033[0m",
-    }.get(nivel, "\033[0m")
-    print(f"{cor}[{ts}] [RETIFICADOR ] {icon} {msg}\033[0m", flush=True)
 
 # ─────────────────────────────────────────────
 #  HEALTH-CHECK SERVER (porta 6011)
@@ -75,7 +77,62 @@ def iniciar_health_server(porta: int = PORTA_HEALTH):
 
     t = threading.Thread(target=_serve, daemon=True)
     t.start()
-    log("INFO", f"Health-check ativo na porta {porta}")
+    log("DEBUG", f"Health-check ativo na porta {porta}")
+
+
+# ─────────────────────────────────────────────
+#  SERVIDOR DA FILA PARA O GRAPHPROCESSOR (NOVO)
+# ─────────────────────────────────────────────
+def iniciar_servidor_grafo(porta: int = PORTA_GRAFO):
+    """
+    Aceita ligações persistentes do GraphProcessor.
+    Protocolo:
+      cliente envia: {"acao": "pedir_proximo"}
+      servidor responde com o próximo JSON disponível na fila (bloqueia até haver)
+
+    Suporta apenas um cliente de cada vez (o GraphProcessor é único).
+    Se um segundo cliente se ligar, fica em espera até o primeiro fechar.
+    """
+    def _serve():
+        try:
+            listener = Listener(("localhost", porta), authkey=AUTHKEY_GRAFO)
+        except OSError as e:
+            log("ERRO", f"Não foi possível abrir porta {porta}: {e}")
+            return
+
+        log("HUMANO", f"Servidor de fila para GraphProcessor ativo na porta {porta}")
+
+        while True:
+            try:
+                conn = listener.accept()
+            except Exception as e:
+                log("AVISO", f"accept() falhou no servidor de fila: {e}")
+                continue
+
+            log("DEBUG", "GraphProcessor ligou-se à fila.")
+            try:
+                while True:
+                    msg = conn.recv()
+                    if not isinstance(msg, dict):
+                        conn.send({"erro": "formato_invalido"})
+                        continue
+                    if msg.get("acao") != "pedir_proximo":
+                        conn.send({"erro": "acao_desconhecida"})
+                        continue
+
+                    # bloqueia até haver pacote
+                    pacote = _fila_grafo.get()
+                    conn.send(pacote)
+            except (EOFError, ConnectionResetError):
+                log("AVISO", "GraphProcessor desligou-se da fila.")
+            except Exception as e:
+                log("ERRO", f"Erro no servidor de fila: {e}")
+            finally:
+                try: conn.close()
+                except Exception: pass
+
+    threading.Thread(target=_serve, daemon=True).start()
+
 
 # ─────────────────────────────────────────────
 #  SERIALIZAÇÃO JSON SEGURA
@@ -102,36 +159,28 @@ def numpy_para_python(obj):
 #  FUNÇÕES DE CÂMERA
 # ─────────────────────────────────────────────
 # Cache dos mapas de undistort (calculados uma vez por resolução).
-# Evita recomputar cv2.initUndistortRectifyMap em cada frame de produção.
-_UNDISTORT_MAPS: dict[tuple[int, int], tuple[np.ndarray, np.ndarray]] = {}
+_UNDISTORT_MAPS: dict = {}
 
-def _obter_maps_undistort(w: int, h: int) -> tuple[np.ndarray, np.ndarray]:
-    """Devolve (map1, map2) para cv2.remap, criando-os se ainda não existirem."""
+def _obter_maps_undistort(w: int, h: int):
     chave = (w, h)
     if chave not in _UNDISTORT_MAPS:
         map1, map2 = cv2.initUndistortRectifyMap(
             K_CAM, D_CAM, None, K_CAM, (w, h), cv2.CV_16SC2)
         _UNDISTORT_MAPS[chave] = (map1, map2)
-        log("INFO", f"Mapas de undistort pré-calculados para {w}×{h}px.")
+        log("DEBUG", f"Mapas de undistort pré-calculados para {w}×{h}px.")
     return _UNDISTORT_MAPS[chave]
 
-def aplicar_undistort(img: np.ndarray) -> np.ndarray:
+def aplicar_undistort(img):
     h, w = img.shape[:2]
     map1, map2 = _obter_maps_undistort(w, h)
     return cv2.remap(img, map1, map2, interpolation=cv2.INTER_LINEAR)
 
-def undistort_ponto(cx: float, cy: float) -> tuple[float, float]:
+def undistort_ponto(cx: float, cy: float):
     pt = np.array([[[cx, cy]]], dtype=np.float32)
     pt_corr = cv2.undistortPoints(pt, K_CAM, D_CAM, None, K_CAM)
     return float(pt_corr[0][0][0]), float(pt_corr[0][0][1])
 
-def aplicar_topdown(img: np.ndarray, H: np.ndarray,
-                    out_w: int, out_h: int) -> np.ndarray:
-    """
-    Aplica undistort + warpPerspective para obter a vista de cima do plano de jogo.
-    O tamanho de saída (out_w × out_h) deve corresponder a (W_real_m × ppm, D_real_m × ppm)
-    para que cada píxel da imagem retificada seja um quadrado de 1/ppm metros.
-    """
+def aplicar_topdown(img, H, out_w: int, out_h: int):
     img_undist = aplicar_undistort(img)
     return cv2.warpPerspective(
         img_undist, H, (out_w, out_h),
@@ -140,36 +189,27 @@ def aplicar_topdown(img: np.ndarray, H: np.ndarray,
         borderValue=(0, 0, 0),
     )
 
-# ─────────────────────────────────────────────
-#  MODO CALIBRAÇÃO
-# ─────────────────────────────────────────────
+
+# ═════════════════════════════════════════════════════════════════════
+#  MODO CALIBRAÇÃO  (inalterado em relação à versão anterior)
+# ═════════════════════════════════════════════════════════════════════
 def calibrar_via_socket():
-    """
-    Fase de calibração interativa:
-      1. Aguarda frame via socket (enviado pelo imageStreaming)
-      2. Aplica undistort ao frame
-      3. Utilizador marca N pontos na imagem
-      4. Imagem fica VISÍVEL e aberta enquanto o utilizador insere coordenadas
-      5. Calcula homografia, guarda JSON e imagem de referência anotada
-    """
     iniciar_health_server()
 
-    log("FASE", "Servidor de calibração ativo na porta 6001")
-    log("INFO", "Aguardando frame do imageStreaming... (captura com tecla C)")
-
+    log("HUMANO", "Servidor de calibração ativo na porta 6001")
+    log("HUMANO", "Aguardando frame do imageStreaming... (captura com tecla C)")
     address = ("localhost", PORTA)
     with Listener(address, authkey=AUTHKEY) as listener:
         with listener.accept() as conn:
             pacote = conn.recv()
             img    = pacote["frame"]
-    log("OK", "Frame recebido. A preparar janela de calibração...")
+    log("HUMANO", "Frame recebido. A preparar janela de calibração...")
 
     img_undist = aplicar_undistort(img)
     h_img, w_img = img_undist.shape[:2]
 
-    # ── Número de pontos ────────────────────────────────────
     print()
-    log("INFO", "Quantos pontos de referência vai marcar? (mínimo 4, recomendado 6+)")
+    log("HUMANO", "Quantos pontos de referência vai marcar? (mínimo 4, recomendado 6+)")
     while True:
         try:
             n = int(input("  >>> "))
@@ -180,12 +220,10 @@ def calibrar_via_socket():
         except ValueError:
             log("AVISO", "Entrada inválida. Insere um número inteiro (ex: 6).")
 
-    # ── Recolha de pontos na imagem ────────────────────────
     pts_px   = []
     JANELA   = "CALIBRACAO — Marque os pontos"
 
     def redesenhar_pontos():
-        """Reconstrói img_draw do zero e desenha todos os pontos actuais."""
         base = img_undist.copy()
         restam = n - len(pts_px)
         if restam > 0:
@@ -211,7 +249,7 @@ def calibrar_via_socket():
     def on_clique(event, x, y, flags, param):
         if event == cv2.EVENT_LBUTTONDOWN and len(pts_px) < n:
             pts_px.append((x, y))
-            log("INFO", f"Ponto {len(pts_px)}/{n} marcado em px=({x}, {y})")
+            log("DEBUG", f"Ponto {len(pts_px)}/{n} marcado em px=({x}, {y})")
             redesenhar_pontos()
 
     cv2.namedWindow(JANELA, cv2.WINDOW_NORMAL)
@@ -219,15 +257,15 @@ def calibrar_via_socket():
     redesenhar_pontos()
     cv2.setMouseCallback(JANELA, on_clique)
 
-    log("INFO", f"Janela aberta. Marque os {n} pontos.")
-    log("INFO", "  Clique esquerdo — adicionar ponto")
-    log("INFO", "  Tecla D         — apagar último ponto")
-    log("INFO", "  ENTER           — confirmar (quando todos marcados)")
-    log("INFO", "  ESC             — cancelar")
+    log("HUMANO", f"Janela aberta. Marque os {n} pontos.")
+    log("HUMANO", "  Clique esquerdo — adicionar ponto")
+    log("HUMANO", "  Tecla D         — apagar último ponto")
+    log("HUMANO", "  ENTER           — confirmar (quando todos marcados)")
+    log("HUMANO", "  ESC             — cancelar")
 
     while True:
         key = cv2.waitKey(50) & 0xFF
-        if key == 13 and len(pts_px) == n:   # ENTER
+        if key == 13 and len(pts_px) == n:
             break
         if key in (ord("d"), ord("D")) and pts_px:
             removido = pts_px.pop()
@@ -239,8 +277,7 @@ def calibrar_via_socket():
             cv2.destroyAllWindows()
             sys.exit(1)
 
-    # ── Atualiza a mesma janela para modo de consulta (sem abrir nova) ──
-    img_draw = redesenhar_pontos()   # captura estado final como img_draw
+    img_draw = redesenhar_pontos()
     cv2.putText(img_draw,
                 "Consulta os numeros enquanto inserires as coordenadas no terminal.",
                 (20, h_img - 70), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 200, 255), 2)
@@ -249,11 +286,10 @@ def calibrar_via_socket():
     cv2.resizeWindow(JANELA, min(w_img, 1400), min(h_img, 900))
     cv2.waitKey(1)
 
-    # ── Recolha de coordenadas reais ───────────────────────
     print()
-    log("FASE", "Inserção de coordenadas reais (metros)")
-    log("INFO", "A janela com os pontos numerados está ABERTA para consulta.")
-    log("INFO", "Alterna entre o terminal e a janela conforme precisares.")
+    log("HUMANO", "Inserção de coordenadas reais (metros)")
+    log("HUMANO", "A janela com os pontos numerados está ABERTA para consulta.")
+    log("HUMANO", "Alterna entre o terminal e a janela conforme precisares.")
     print()
 
     pts_reais = [None] * n
@@ -266,7 +302,6 @@ def calibrar_via_socket():
                 cv2.waitKey(1)
                 xr = float(input(f"    X real (metros): "))
                 yr = float(input(f"    Y real (metros): "))
-                # ── Confirmação imediata ───────────────────
                 conf = input(
                     f"    \033[92m→ ({xr:.3f}m, {yr:.3f}m)\033[0m"
                     f"  ENTER confirmar  |  d apagar: "
@@ -274,18 +309,16 @@ def calibrar_via_socket():
                 if conf == "d":
                     log("AVISO", f"Ponto {i+1} apagado. A reintroduzir...")
                     print()
-                    continue   # volta ao início do while — pede de novo
-                log("OK", f"Ponto {i+1}: real=({xr:.3f}m, {yr:.3f}m)")
+                    continue
+                log("DEBUG", f"Ponto {i+1}: real=({xr:.3f}m, {yr:.3f}m)")
                 print()
                 return [xr, yr]
             except ValueError:
                 log("AVISO", "Valor inválido. Insere um número (ex: 1.50)")
 
-    # Primeira passagem — pedir todos os pontos em sequência
     for i in range(n):
         pts_reais[i] = pedir_coordenada(i)
 
-    # ── Revisão e correção de coordenadas ─────────────────
     while True:
         cv2.waitKey(1)
         print()
@@ -309,7 +342,7 @@ def calibrar_via_socket():
         try:
             idx_corr = int(resp) - 1
             if 0 <= idx_corr < n:
-                log("INFO", f"A reescrever coordenadas do ponto {idx_corr + 1}...")
+                log("HUMANO", f"A reescrever coordenadas do ponto {idx_corr + 1}...")
                 pts_reais[idx_corr] = pedir_coordenada(idx_corr)
             else:
                 log("AVISO", f"Número fora do intervalo (1–{n}). Tenta novamente.")
@@ -318,7 +351,6 @@ def calibrar_via_socket():
 
     cv2.destroyAllWindows()
 
-    # ── Cálculo da homografia ──────────────────────────────
     xs     = [p[0] for p in pts_reais]
     ys     = [p[1] for p in pts_reais]
     x_min  = min(xs);  y_min = min(ys)
@@ -349,7 +381,6 @@ def calibrar_via_socket():
         log("ERRO", "Não foi possível calcular a homografia. Pontos colineares?")
         sys.exit(1)
 
-    # ── Erro de reprojeção ─────────────────────────────────
     erros = []
     for i in range(n):
         ux, uy = undistort_ponto(pts_px[i][0], pts_px[i][1])
@@ -362,14 +393,14 @@ def calibrar_via_socket():
 
     erro_medio_px = float(np.mean(erros))
     erro_medio_m  = float(erro_medio_px / ppm)
-    log("INFO", f"Homografia: {inliers}/{n} inliers | "
-                f"Erro médio: {erro_medio_px:.1f}px ({erro_medio_m*100:.1f}cm)")
+    log("HUMANO", f"Homografia calculada: {inliers}/{n} inliers | "
+                  f"erro médio = {erro_medio_m*100:.1f}cm")
+    log("DEBUG",  f"erro_medio_px={erro_medio_px:.1f}px  ppm={ppm:.2f}")
 
     if erro_medio_m > 0.05:
         log("AVISO", f"Erro elevado ({erro_medio_m*100:.1f}cm > 5cm). "
                      "Considera recalibrar com mais pontos.")
 
-    # ── Guardar calibração ─────────────────────────────────
     PASTA_CALIB_REF.mkdir(parents=True, exist_ok=True)
 
     out_w_px = int(round(W_real * ppm))
@@ -393,9 +424,8 @@ def calibrar_via_socket():
 
     with open(CALIB_FILE, "w") as f:
         json.dump(calib, f, indent=4)
-    log("OK", f"Calibração guardada: {CALIB_FILE.name}")
+    log("HUMANO", f"Calibração guardada: {CALIB_FILE.name}")
 
-    # ── Guardar imagem de referência anotada ───────────────
     IMG_REF_PATH = BASE_PATH / "calibracao_referencia.png"
     img_ref = img_undist.copy()
 
@@ -418,12 +448,9 @@ def calibrar_via_socket():
                 cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 120), 2)
 
     cv2.imwrite(str(IMG_REF_PATH), img_ref)
-    log("OK", f"Imagem de referência guardada: {IMG_REF_PATH.name}")
+    log("DEBUG", f"Imagem de referência guardada: {IMG_REF_PATH.name}")
 
-    # ── Guardar registo histórico em resultados/calibracao/ ─
     ts_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-
-    # JSON com todos os pontos (pixel + metro) usados nesta calibração
     pontos_calib = {
         "data":       datetime.now().isoformat(timespec="seconds"),
         "n_pontos":   n,
@@ -444,18 +471,16 @@ def calibrar_via_socket():
     json_calib_path = PASTA_CALIB_REF / f"pontos_{ts_str}.json"
     with open(json_calib_path, "w") as f:
         json.dump(pontos_calib, f, indent=4, ensure_ascii=False)
-    log("OK", f"Registo de pontos guardado: resultados/calibracao/{json_calib_path.name}")
+    log("DEBUG", f"Registo de pontos guardado: resultados/calibracao/{json_calib_path.name}")
 
-    # Imagem anotada com as posições dos pontos (cópia na subpasta)
     img_calib_path = PASTA_CALIB_REF / f"imagem_{ts_str}.png"
     ok_enc, buf = cv2.imencode(".png", img_ref)
     if ok_enc:
         img_calib_path.write_bytes(buf.tobytes())
-        log("OK", f"Imagem de calibração guardada: resultados/calibracao/{img_calib_path.name}")
+        log("DEBUG", f"Imagem de calibração guardada: resultados/calibracao/{img_calib_path.name}")
     else:
         log("AVISO", "Não foi possível guardar a imagem na pasta calibracao.")
 
-    # ── Pré-visualização top-down (verificação visual da homografia) ─
     try:
         img_topdown = cv2.warpPerspective(
             img_ref, H, (out_w_px, out_h_px),
@@ -471,23 +496,23 @@ def calibrar_via_socket():
         ok_enc, buf = cv2.imencode(".png", img_topdown)
         if ok_enc:
             topdown_path.write_bytes(buf.tobytes())
-            log("OK", f"Preview top-down guardado: resultados/calibracao/{topdown_path.name}")
+            log("DEBUG", f"Preview top-down guardado: resultados/calibracao/{topdown_path.name}")
         else:
             log("AVISO", "Não foi possível codificar o preview top-down.")
     except Exception as e:
         log("AVISO", f"Falha ao gerar preview top-down: {e}")
 
-    log("OK", f"  ppm={ppm:.1f} | área={W_real:.2f}×{D_real:.2f}m | "
-              f"saída top-down={out_w_px}×{out_h_px}px")
+    log("HUMANO", f"Quadra calibrada: {W_real:.2f}m × {D_real:.2f}m")
+    log("DEBUG",  f"ppm={ppm:.1f} | saída top-down={out_w_px}×{out_h_px}px")
     sys.exit(0)
 
-# ─────────────────────────────────────────────
+
+# ═════════════════════════════════════════════════════════════════════
 #  MODO PRODUÇÃO
-# ─────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════
 def _px_para_metros(cx: float, cy: float,
-                    H: np.ndarray, ppm: float,
-                    x_min: float, y_min: float) -> tuple[float, float]:
-    """Aplica undistort + homografia e devolve (x_metros, y_metros)."""
+                    H, ppm: float,
+                    x_min: float, y_min: float):
     ux, uy  = undistort_ponto(cx, cy)
     pt_warp = cv2.perspectiveTransform(
         np.array([[[ux, uy]]], dtype=np.float32), H)
@@ -497,29 +522,17 @@ def _px_para_metros(cx: float, cy: float,
 
 
 def servidor_producao(calib: dict):
-    """
-    Servidor de retificação em loop contínuo.
-    Recebe pacotes do VisionProcessing com bounding boxes em píxeis
-    e posição ArUco do robô, converte tudo para metros e guarda:
-      - resultados/posicoes/posicao_NNNN.json  — coordenadas em metros
-      - resultados/imagens/frame_NNNN.jpg      — frame anotado
-    """
     H     = np.array(calib["H_mat"])
     ppm   = calib["ppm"]
     x_min = calib.get("x_min", 0.0)
     y_min = calib.get("y_min", 0.0)
 
-    # Tamanho do canvas de saída do warpPerspective.
-    # Preferimos os campos guardados na calibração; se não existirem
-    # (calibrações antigas), caímos para a resolução do frame de calibração.
     if "output_size_px" in calib and calib["output_size_px"]:
         out_w_px, out_h_px = calib["output_size_px"]
     elif "W_real_m" in calib and "D_real_m" in calib:
         out_w_px = int(round(float(calib["W_real_m"]) * ppm))
         out_h_px = int(round(float(calib["D_real_m"]) * ppm))
     else:
-        # Fallback: usa a resolução da calibração — funciona porque o ppm
-        # foi escolhido para que max(out) ≈ max(resolucao_calib).
         res = calib.get("resolucao_calib", [1920, 1080])
         out_w_px, out_h_px = int(res[0]), int(res[1])
         log("AVISO", "Calibração antiga sem 'output_size_px' — a usar fallback "
@@ -530,17 +543,19 @@ def servidor_producao(calib: dict):
     PASTA_POSICOES.mkdir(parents=True, exist_ok=True)
     PASTA_IMAGENS.mkdir(parents=True, exist_ok=True)
     PASTA_IMAGENS_TD.mkdir(parents=True, exist_ok=True)
-    log("OK", f"Pastas prontas: {PASTA_POSICOES.name} | {PASTA_IMAGENS.name} | "
+    log("DEBUG", f"Pastas prontas: {PASTA_POSICOES.name} | {PASTA_IMAGENS.name} | "
               f"{PASTA_IMAGENS_TD.name}")
-    log("INFO", f"Vista top-down: {out_w_px}×{out_h_px}px @ {ppm:.1f}ppm "
+    log("DEBUG", f"Vista top-down: {out_w_px}×{out_h_px}px @ {ppm:.1f}ppm "
                 f"({out_w_px/ppm:.2f}m × {out_h_px/ppm:.2f}m)")
 
-    log("FASE", "Servidor de retificação ativo (porta 6001)")
-    log("INFO", f"Calibração: ppm={ppm:.1f} | erro médio={calib.get('erro_medio_m','?')}m")
-    log("INFO", f"Posições  → .../{PASTA_POSICOES.relative_to(BASE_PATH)}")
-    log("INFO", f"Imagens   → .../{PASTA_IMAGENS.relative_to(BASE_PATH)}")
-    log("INFO", f"Top-down  → .../{PASTA_IMAGENS_TD.relative_to(BASE_PATH)}")
-    log("INFO", "Aguardando pacotes do VisionProcessing...")
+    # NOVO: arrancar o servidor de fila para o GraphProcessor
+    iniciar_servidor_grafo()
+
+    log("HUMANO", "Retificador pronto. A aguardar pacotes do VisionProcessing...")
+    log("DEBUG",  f"Calibração: ppm={ppm:.1f} | erro médio={calib.get('erro_medio_m','?')}m")
+    log("DEBUG",  f"Posições  → .../{PASTA_POSICOES.relative_to(BASE_PATH)}")
+    log("DEBUG",  f"Imagens   → .../{PASTA_IMAGENS.relative_to(BASE_PATH)}")
+    log("DEBUG",  f"Top-down  → .../{PASTA_IMAGENS_TD.relative_to(BASE_PATH)}")
 
     total_frames = 0
     total_bolas  = 0
@@ -553,7 +568,7 @@ def servidor_producao(calib: dict):
                     pacote   = conn.recv()
                     indice   = pacote["indice"]
                     bolas_px = pacote["bolas_px"]
-                    robo_px  = pacote.get("robo_px", {})   # compatível com versões antigas
+                    robo_px  = pacote.get("robo_px", {})
                     frame    = pacote["frame"]
 
                     # ── Retificar bolas ────────────────────────────────────
@@ -581,7 +596,6 @@ def servidor_producao(calib: dict):
                             H, ppm, x_min, y_min)
                         res_robo["traseiro"] = {"x": xm, "y": ym}
 
-                    # Log do robô
                     robo_log = "—"
                     if res_robo["frontal"] or res_robo["traseiro"]:
                         partes = []
@@ -595,7 +609,6 @@ def servidor_producao(calib: dict):
                             partes.append(f"{res_robo['orientacao_graus']:.1f}°")
                         robo_log = " ".join(partes)
 
-                    # ── Construir JSON de saída ────────────────────────────
                     latencia = round(
                         (time.time() - pacote["timestamp_visao"]) * 1000, 2)
                     saida = {
@@ -606,15 +619,26 @@ def servidor_producao(calib: dict):
                         "robo":        res_robo,
                     }
 
-                    # ── Guardar posições ───────────────────────────────────
+                    saida_serializavel = numpy_para_python(saida)
+
+                    # ── Guardar posições (Opção B preservada) ──────────────
                     fich_json = PASTA_POSICOES / f"posicao_{indice:04d}.json"
                     with open(fich_json, "w") as f:
-                        json.dump(numpy_para_python(saida), f, indent=4)
+                        json.dump(saida_serializavel, f, indent=4)
+
+                    # ── NOVO: empurrar para fila do GraphProcessor (Opção A) ─
+                    try:
+                        _fila_grafo.put_nowait(saida_serializavel)
+                    except queue.Full:
+                        # Drop do mais antigo para não estagnar
+                        try:
+                            _fila_grafo.get_nowait()
+                            _fila_grafo.put_nowait(saida_serializavel)
+                            log("AVISO", "Fila do grafo cheia — descartado pacote mais antigo.")
+                        except Exception:
+                            pass
 
                     # ── Guardar imagem ─────────────────────────────────────
-                    # Usa imencode + escrita binária em vez de cv2.imwrite,
-                    # evitando falhas com caminhos Unicode/acentuados no Windows
-                    # (ex.: OneDrive com "4º Ano", espaços, etc.)
                     fich_img = PASTA_IMAGENS / f"frame_{indice:04d}.jpg"
                     if frame is not None and hasattr(frame, "shape"):
                         try:
@@ -622,17 +646,13 @@ def servidor_producao(calib: dict):
                                 ".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
                             if ok_enc:
                                 fich_img.write_bytes(buf.tobytes())
-                                log("OK", f"Imagem guardada: {fich_img.name}")
+                                log("DEBUG", f"Imagem guardada: {fich_img.name}")
                             else:
                                 log("ERRO", f"cv2.imencode falhou para {fich_img.name} "
                                             f"(shape={frame.shape}, dtype={frame.dtype})")
                         except Exception as e_img:
                             log("ERRO", f"Erro ao guardar imagem {fich_img.name}: {e_img}")
 
-                        # ── Vista de cima (homografia aplicada) ──────────
-                        # undistort + warpPerspective sobre o MESMO frame anotado,
-                        # para que as bounding boxes e marcadores ArUco também
-                        # apareçam na vista corrigida.
                         fich_img_td = PASTA_IMAGENS_TD / f"frame_{indice:04d}.jpg"
                         try:
                             frame_td = aplicar_topdown(frame, H, out_w_px, out_h_px)
@@ -640,7 +660,7 @@ def servidor_producao(calib: dict):
                                 ".jpg", frame_td, [cv2.IMWRITE_JPEG_QUALITY, 90])
                             if ok_td:
                                 fich_img_td.write_bytes(buf_td.tobytes())
-                                log("OK", f"Top-down guardado: {fich_img_td.name}")
+                                log("DEBUG", f"Top-down guardado: {fich_img_td.name}")
                             else:
                                 log("ERRO", f"cv2.imencode falhou para {fich_img_td.name}")
                         except Exception as e_td:
@@ -653,9 +673,16 @@ def servidor_producao(calib: dict):
 
                     total_frames += 1
                     total_bolas  += len(res_bolas)
-                    log("OK",
+                    # Spam de cada frame só para debug; o utilizador vê a evolução
+                    # no GraphProcessor (janela ao vivo) — não precisa nesta consola.
+                    log("DEBUG",
                         f"Frame {indice:04d} | {len(res_bolas)} bola(s) | "
                         f"robô={robo_log} | latência={latencia}ms | total={total_frames} frames")
+                    # Mas a cada 50 frames damos um pulso humano para confirmar vida
+                    if total_frames % 50 == 0:
+                        log("HUMANO",
+                            f"{total_frames} frames processados "
+                            f"({total_bolas} bolas no total).")
 
                 except Exception as e:
                     log("ERRO", f"Erro ao processar pacote: {e}")
@@ -680,10 +707,9 @@ if __name__ == "__main__":
     else:
         if not CALIB_FILE.exists():
             log("ERRO", f"Ficheiro de calibração não encontrado: {CALIB_FILE}")
-            log("INFO", "Executa com --calibrar primeiro, ou usa o MasterControl.py")
+            log("HUMANO", "Executa com --calibrar primeiro, ou usa o MasterControl.py")
             sys.exit(1)
 
-        # Health-server sobe ANTES de qualquer operação que possa falhar
         iniciar_health_server()
 
         try:
@@ -695,6 +721,7 @@ if __name__ == "__main__":
             time.sleep(60)
             sys.exit(1)
 
-        log("OK", f"Calibração carregada: {calib.get('data','data desconhecida')} | "
-                  f"ppm={calib['ppm']:.1f} | {calib.get('n_pontos','?')} pontos")
+        log("HUMANO", f"Calibração de {calib.get('data','data desconhecida')} carregada.")
+        log("DEBUG",  f"ppm={calib['ppm']:.1f} | {calib.get('n_pontos','?')} pontos | "
+                     f"erro_medio_m={calib.get('erro_medio_m','?')}")
         servidor_producao(calib)
