@@ -1,3 +1,19 @@
+"""
+Modos de Operação:
+
+  - calibrar    Recebe um frame via socket (porta 6001), permite ao utilizador marcar pontos de referência com coordenadas reais conhecidas,
+                calcula a homografia e guarda o JSON de calibração.
+
+  (sem args)   Servidor de produção. Recebe pacotes do VisionProcessing com bounding boxes em píxeis, aplica a homografia e guarda
+               as coordenadas em metros em ficheiros JSON.
+
+Parâmetros intrínsecos: iPhone 16 (5712×4284), f≈20587 / 20591)
+
+NOTA: Uma thread separada fica à escuta na porta 6011 (PORTA_HEALTH) exclusivamente para responder a health-checks do MasterControl,
+      evitando colisões com o Listener de autenticação na porta 6001.
+
+"""
+
 import cv2
 import numpy as np
 import json
@@ -35,11 +51,11 @@ PORTA_GRAFO  = 6020                              # NOVO — fila para o GraphPro
 AUTHKEY      = b"retificador_ufsc"
 AUTHKEY_GRAFO = b"grafo_ufsc"                    # NOVO
 
-# Parâmetros intrínsecos iPhone 16 (landscape, 4032×3024)
-K_CAM = np.array([[5823,    0, 2016],
-                   [   0, 5823, 1512],
-                   [   0,    0,    1]], dtype=np.float64)
-D_CAM = np.array([0.122, -0.246, 0.0001, -0.0002, 0.176], dtype=np.float64)
+# Parâmetros intrínsecos iPhone 16 câmera principal 26mm, 5712×4284
+K_CAM = np.array([[20587,     0, 2856],
+                   [    0, 20591, 2142],
+                   [    0,     0,    1]], dtype=np.float64)
+D_CAM = np.array([0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float64)
 
 # ─────────────────────────────────────────────
 #  FILA PARA O GRAPH PROCESSOR
@@ -367,14 +383,18 @@ def calibrar_via_socket():
         [((p[0] - x_min) * ppm, (p[1] - y_min) * ppm) for p in pts_reais],
         dtype=np.float32
     )
-    pts_origem_px = np.array(pts_px, dtype=np.float32)
+    # Aplicar undistort nos pontos de origem ANTES de calcular a homografia
+    pts_origem_undist = np.array(
+        [undistort_ponto(px, py) for (px, py) in pts_px],
+        dtype=np.float32
+    )
 
     if n == 4:
-        H, mask = cv2.findHomography(pts_origem_px, pts_destino_px)
+        H, mask = cv2.findHomography(pts_origem_undist, pts_destino_px)
         inliers  = 4
     else:
-        H, mask = cv2.findHomography(pts_origem_px, pts_destino_px,
-                                      cv2.RANSAC, ransacReprojThreshold=2.0)
+        H, mask = cv2.findHomography(pts_origem_undist, pts_destino_px,
+                                  cv2.RANSAC, ransacReprojThreshold=5.0)
         inliers  = int(mask.sum()) if mask is not None else 0
 
     if H is None:
@@ -383,9 +403,9 @@ def calibrar_via_socket():
 
     erros = []
     for i in range(n):
-        ux, uy = undistort_ponto(pts_px[i][0], pts_px[i][1])
+        # pts_origem_undist já calculado no passo anterior
         dst_pred = cv2.perspectiveTransform(
-            np.array([[[ux, uy]]], dtype=np.float32), H
+            np.array([[[pts_origem_undist[i][0], pts_origem_undist[i][1]]]], dtype=np.float32), H
         )
         dx = float(dst_pred[0][0][0]) - float(pts_destino_px[i][0])
         dy = float(dst_pred[0][0][1]) - float(pts_destino_px[i][1])
