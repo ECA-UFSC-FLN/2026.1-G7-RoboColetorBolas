@@ -442,12 +442,50 @@ def iniciar_visao():
                     indice = stats["frames"]
                     t_recv = time.time()
                     frame  = pacote["frame"]
+                    frame_debug_original = pacote.get("frame_debug_original")
                     escala_origem_x = float(pacote.get("escala_origem_x", 1.0))
                     escala_origem_y = float(pacote.get("escala_origem_y", 1.0))
 
                     # Lê o flag global no início do processamento (snapshot
                     # consistente para este frame mesmo se o flag mudar a meio)
                     skip_yolo = _em_disparo
+
+                    # ── Deteção ArUco (robô) — sempre, antes do YOLO ─────
+                    t_aruco  = time.time()
+                    frame_aruco = frame
+                    escala_aruco = 1.0
+                    h_proc, w_proc = frame.shape[:2]
+                    if ARUCO_LARGURA_PX > 0 and ARUCO_LARGURA_PX < w_proc:
+                        escala_aruco = w_proc / float(ARUCO_LARGURA_PX)
+                        novo_h = max(1, int(round(h_proc / escala_aruco)))
+                        frame_aruco = cv2.resize(
+                            frame, (ARUCO_LARGURA_PX, novo_h),
+                            interpolation=cv2.INTER_AREA,
+                        )
+                    gray = cv2.cvtColor(frame_aruco, cv2.COLOR_BGR2GRAY)
+                    robo_det = detetar_robo(
+                        gray, aruco_detector, clahe,
+                        escala_saida=escala_aruco,
+                    )
+                    robo = persistencia_aruco.atualizar(robo_det)
+                    for chave in ("frontal", "traseiro"):
+                        if robo.get(chave):
+                            robo[chave]["cx"] = round(robo[chave]["cx"] * escala_origem_x, 1)
+                            robo[chave]["cy"] = round(robo[chave]["cy"] * escala_origem_y, 1)
+                    ms_aruco = (time.time() - t_aruco) * 1000
+
+                    if robo["frontal"] or robo["traseiro"]:
+                        pacote_aruco = {
+                            "frame":           None,
+                            "bolas_px":        [],
+                            "robo_px":         robo,
+                            "indice":          indice,
+                            "timestamp_visao": pacote["timestamp"],
+                            "tipo":            "aruco_fast",
+                        }
+                        ok_fast = enviar_para_retificador(pacote_aruco, tentativas=1)
+                        if not ok_fast:
+                            log("DEBUG", f"Frame {indice:04d}: envio ArUco rápido falhou.")
 
                     # ── Inferência YOLO (bolas) — saltada em disparo ───
                     bolas = []
@@ -485,30 +523,6 @@ def iniciar_visao():
                     else:
                         stats["frames_yolo_skip"] += 1
 
-                    # ── Deteção ArUco (robô) — sempre ───────────────────
-                    t_aruco  = time.time()
-                    frame_aruco = frame
-                    escala_aruco = 1.0
-                    h_proc, w_proc = frame.shape[:2]
-                    if ARUCO_LARGURA_PX > 0 and ARUCO_LARGURA_PX < w_proc:
-                        escala_aruco = w_proc / float(ARUCO_LARGURA_PX)
-                        novo_h = max(1, int(round(h_proc / escala_aruco)))
-                        frame_aruco = cv2.resize(
-                            frame, (ARUCO_LARGURA_PX, novo_h),
-                            interpolation=cv2.INTER_AREA,
-                        )
-                    gray = cv2.cvtColor(frame_aruco, cv2.COLOR_BGR2GRAY)
-                    robo_det = detetar_robo(
-                        gray, aruco_detector, clahe,
-                        escala_saida=escala_aruco,
-                    )
-                    robo = persistencia_aruco.atualizar(robo_det)
-                    for chave in ("frontal", "traseiro"):
-                        if robo.get(chave):
-                            robo[chave]["cx"] = round(robo[chave]["cx"] * escala_origem_x, 1)
-                            robo[chave]["cy"] = round(robo[chave]["cy"] * escala_origem_y, 1)
-                    ms_aruco = (time.time() - t_aruco) * 1000
-
                     # ── Log resumido ───────────────────────────────────
                     robo_str = "—"
                     if robo["frontal"] or robo["traseiro"]:
@@ -533,14 +547,14 @@ def iniciar_visao():
 
                     frame_debug = None
                     agora_debug = time.time()
-                    if enviar_frame_debug and agora_debug >= proximo_frame_debug:
+                    if (frame_debug_original is not None and hasattr(frame_debug_original, "shape")):
                         proximo_frame_debug = agora_debug + intervalo_frame_debug_s
-                        frame_debug = frame.copy()
+                        frame_debug = frame_debug_original.copy()
                         for idx_b, b in enumerate(bolas):
-                            x1 = b.get("x1_proc", b["x1"])
-                            y1 = b.get("y1_proc", b["y1"])
-                            x2 = b.get("x2_proc", b["x2"])
-                            y2 = b.get("y2_proc", b["y2"])
+                            x1 = b["x1"]
+                            y1 = b["y1"]
+                            x2 = b["x2"]
+                            y2 = b["y2"]
                             cv2.rectangle(frame_debug,
                                           (x1, y1), (x2, y2),
                                           (0, 255, 0), 2)

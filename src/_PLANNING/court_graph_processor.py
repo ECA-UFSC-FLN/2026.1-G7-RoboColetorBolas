@@ -40,7 +40,7 @@ import time
 import socket
 import threading
 import argparse
-from queue import Queue, Empty
+from queue import Queue, Empty, Full
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -94,7 +94,7 @@ N_OBS_MIN_ESTAVEL = 3                # mín. de observações para bola contar
 TEMPO_MIN_ESTAVEL_S = 1.0            # confirma estabilidade independentemente do FPS
 VELOCIDADE_MAX_PARADA_M_S = 0.08     # acima disto a bola ainda está em movimento
 TEMPO_EXPIRAR_BOLA_S = 1.5           # remove rastos temporários sem novas observações
-INTERVALO_VIS     = 0.25             # refresh da janela matplotlib (s) — fixo
+INTERVALO_VIS     = 0.05             # refresh da janela matplotlib (s) — fixo
 TIMEOUT_RET       = 1.5              # timeout em cada pedido de JSON — fixo
 
 # ─────────────────────────────────────────────
@@ -1073,7 +1073,17 @@ def loop_cliente_retificador(estado: EstadoGrafo, fila_jsons: Queue, parar: thre
                         if conn.poll(timeout=TIMEOUT_RET):
                             pacote = conn.recv()
                             if pacote and isinstance(pacote, dict):
-                                fila_jsons.put(pacote)
+                                try:
+                                    fila_jsons.put_nowait(pacote)
+                                except Full:
+                                    try:
+                                        fila_jsons.get_nowait()
+                                    except Empty:
+                                        pass
+                                    try:
+                                        fila_jsons.put_nowait(pacote)
+                                    except Full:
+                                        pass
                         else:
                             # nada novo; pequena pausa e tenta de novo
                             time.sleep(0.1)
@@ -1416,7 +1426,7 @@ def main():
 
     # Threads
     parar = threading.Event()
-    fila_jsons: Queue = Queue(maxsize=200)
+    fila_jsons: Queue = Queue(maxsize=20)
 
     t_cli = threading.Thread(
         target=loop_cliente_retificador,
@@ -1443,8 +1453,14 @@ def main():
         while True:
             # 1. Processar pacotes pendentes
             try:
-                pacote = fila_jsons.get(timeout=0.1)
+                pacote = fila_jsons.get(timeout=0.01)
                 processar_pacote(estado, pacote)
+                for _ in range(8):
+                    try:
+                        pacote = fila_jsons.get_nowait()
+                    except Empty:
+                        break
+                    processar_pacote(estado, pacote)
 
                 # 2. Verificar disparo (só quando não há execução ativa)
                 if MODO_OPERACAO == "GLOBAL":

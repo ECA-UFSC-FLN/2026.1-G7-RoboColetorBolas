@@ -252,6 +252,8 @@ def desenhar_overlay(frame, stats: dict, modo: str, pausado: bool):
 def stream():
     cfg = _params.carregar()
     largura_processamento = int(cfg.get("processamento_largura_px", 960))
+    enviar_debug_original = bool(int(cfg.get("guardar_imagens_debug", 0)))
+    intervalo_debug_original_s = float(cfg.get("intervalo_guardar_imagens_s", 5.0))
 
     def tentar_abrir_camera():
         """
@@ -326,6 +328,7 @@ def stream():
     t_fps   = time.time()
     frames_fps = 0
     t_envios = time.time()
+    proximo_debug_original = 0.0
     fila_envio: Queue = Queue(maxsize=1)
     parar_envio = threading.Event()
     if modo == "PRODUCAO":
@@ -405,14 +408,18 @@ def stream():
                     frame_proc, sx, sy = preparar_frame_producao(
                         frame, largura_processamento
                     )
+                    agora_pacote = time.time()
                     pacote = {
                         "frame": frame_proc,
-                        "timestamp": time.time(),
+                        "timestamp": agora_pacote,
                         "nome": "cam_principal",
                         "escala_origem_x": sx,
                         "escala_origem_y": sy,
                         "resolucao_original": [w_real, h_real],
                     }
+                    if enviar_debug_original and agora_pacote >= proximo_debug_original:
+                        pacote["frame_debug_original"] = frame.copy()
+                        proximo_debug_original = agora_pacote + intervalo_debug_original_s
                     try:
                         fila_envio.put_nowait(pacote)
                     except Full:
