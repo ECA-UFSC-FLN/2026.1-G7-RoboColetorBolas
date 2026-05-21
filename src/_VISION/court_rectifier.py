@@ -1013,6 +1013,7 @@ def servidor_producao(calib: dict):
                         (time.time() - pacote["timestamp_visao"]) * 1000, 2)
                     saida = {
                         "indice":      indice,
+                        "tipo":        pacote.get("tipo", "vision"),
                         "latencia_ms": latencia,
                         "n_bolas":     len(res_bolas),
                         "trajetoria":  res_bolas,

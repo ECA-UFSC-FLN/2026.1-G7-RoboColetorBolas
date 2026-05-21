@@ -1321,15 +1321,22 @@ class VisualizadorAoVivo:
 def processar_pacote(estado: EstadoGrafo, pacote: dict):
     """Aplica um pacote vindo do retificador ao estado interno."""
     indice  = pacote.get("indice", -1)
+    tipo    = pacote.get("tipo", "vision")
     bolas   = pacote.get("trajetoria", []) or []
     robo    = pacote.get("robo") or {}
 
     with estado.lock:
-        estado.robo = {
-            "frontal":          robo.get("frontal"),
-            "traseiro":         robo.get("traseiro"),
-            "orientacao_graus": robo.get("orientacao_graus"),
-        }
+        tem_robo = (
+            robo.get("frontal") is not None
+            or robo.get("traseiro") is not None
+            or robo.get("orientacao_graus") is not None
+        )
+        if tipo == "aruco" or tem_robo:
+            estado.robo = {
+                "frontal":          robo.get("frontal"),
+                "traseiro":         robo.get("traseiro"),
+                "orientacao_graus": robo.get("orientacao_graus"),
+            }
         estado.ultimo_indice_processado = indice
 
     if MODO_OPERACAO == "GLOBAL":

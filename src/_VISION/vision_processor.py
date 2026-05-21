@@ -152,7 +152,7 @@ def loop_cliente_broadcaster():
                                     f"Disparo GLOBAL ativo — YOLO desligada "
                                     f"(waypoint {wp_idx}/{wp_tot}).")
                             else:
-                                log("HUMANO", "Disparo ativo — YOLO desligada (só ArUco).")
+                                log("HUMANO", "Disparo ativo — YOLO desligada.")
                             log("DEBUG",  f"fase={fase}, faixa={estado.get('faixa_label')}")
                         else:
                             log("HUMANO", "Disparo terminado — YOLO reativada.")
@@ -365,15 +365,10 @@ def enviar_para_retificador(pacote_ret: dict, tentativas: int = 3) -> bool:
 #  SERVIDOR PRINCIPAL
 # ─────────────────────────────────────────────
 def iniciar_visao():
-    global ARUCO_LARGURA_PX, ARUCO_USAR_CLAHE, ARUCO_PERSISTENCIA_S, ARUCO_SUAVIZACAO
     cfg = _params.carregar()
     enviar_frame_debug = bool(int(cfg.get("guardar_imagens_debug", 0)))
     intervalo_frame_debug_s = float(cfg.get("intervalo_guardar_imagens_s", 5.0))
     proximo_frame_debug = 0.0
-    ARUCO_LARGURA_PX = int(cfg.get("aruco_largura_px", ARUCO_LARGURA_PX))
-    ARUCO_USAR_CLAHE = bool(int(cfg.get("aruco_usar_clahe", 0)))
-    ARUCO_PERSISTENCIA_S = float(cfg.get("aruco_persistencia_s", ARUCO_PERSISTENCIA_S))
-    ARUCO_SUAVIZACAO = float(cfg.get("aruco_suavizacao", ARUCO_SUAVIZACAO))
 
     # ── Carregar modelo YOLO ───────────────────────────────
     log("HUMANO", "A carregar modelo YOLO...")
@@ -396,12 +391,6 @@ def iniciar_visao():
         log("ERRO", f"Falha ao carregar YOLO: {e}")
         sys.exit(1)
 
-    # ── Inicializar detetor ArUco + CLAHE ──────────────────
-    aruco_detector = criar_detetor_aruco()
-    clahe = (cv2.createCLAHE(clipLimit=CLAHE_CLIP, tileGridSize=CLAHE_GRID)
-             if ARUCO_USAR_CLAHE else None)
-    persistencia_aruco = PersistenciaAruco(ARUCO_PERSISTENCIA_S, ARUCO_SUAVIZACAO)
-
     # ── Health-server ──────────────────────────────────────
     iniciar_health_server()
 
@@ -412,7 +401,6 @@ def iniciar_visao():
     stats = {
         "frames":           0,
         "bolas_total":      0,
-        "robo_detetado":    0,
         "latencia_soma":    0.0,
         "erros":            0,
         "frames_yolo_skip": 0,
@@ -421,8 +409,7 @@ def iniciar_visao():
     log("HUMANO", "VisionProcessing pronto. A aguardar frames...")
     log("DEBUG",  f"servidor ativo na porta {PORTA_ENTRADA}")
     log("DEBUG",  f"envio de frames para escrita/debug={'ON' if enviar_frame_debug else 'OFF'}")
-    log("DEBUG",  f"ArUco: largura={ARUCO_LARGURA_PX}px | CLAHE={'ON' if ARUCO_USAR_CLAHE else 'OFF'} | "
-                  f"persistência={ARUCO_PERSISTENCIA_S:.2f}s | suavização={ARUCO_SUAVIZACAO:.2f}")
+    log("DEBUG",  "YOLO isolado: ArUco corre no processo _VISION/aruco_processor.py")
 
     address = ("localhost", PORTA_ENTRADA)
     with Listener(address, authkey=AUTHKEY_VIS) as listener:
@@ -439,7 +426,7 @@ def iniciar_visao():
             with conn:
                 try:
                     pacote = conn.recv()
-                    indice = stats["frames"]
+                    indice = int(pacote.get("indice", stats["frames"]))
                     t_recv = time.time()
                     frame  = pacote["frame"]
                     frame_debug_original = pacote.get("frame_debug_original")
@@ -450,42 +437,11 @@ def iniciar_visao():
                     # consistente para este frame mesmo se o flag mudar a meio)
                     skip_yolo = _em_disparo
 
-                    # ── Deteção ArUco (robô) — sempre, antes do YOLO ─────
-                    t_aruco  = time.time()
-                    frame_aruco = frame
-                    escala_aruco = 1.0
-                    h_proc, w_proc = frame.shape[:2]
-                    if ARUCO_LARGURA_PX > 0 and ARUCO_LARGURA_PX < w_proc:
-                        escala_aruco = w_proc / float(ARUCO_LARGURA_PX)
-                        novo_h = max(1, int(round(h_proc / escala_aruco)))
-                        frame_aruco = cv2.resize(
-                            frame, (ARUCO_LARGURA_PX, novo_h),
-                            interpolation=cv2.INTER_AREA,
-                        )
-                    gray = cv2.cvtColor(frame_aruco, cv2.COLOR_BGR2GRAY)
-                    robo_det = detetar_robo(
-                        gray, aruco_detector, clahe,
-                        escala_saida=escala_aruco,
-                    )
-                    robo = persistencia_aruco.atualizar(robo_det)
-                    for chave in ("frontal", "traseiro"):
-                        if robo.get(chave):
-                            robo[chave]["cx"] = round(robo[chave]["cx"] * escala_origem_x, 1)
-                            robo[chave]["cy"] = round(robo[chave]["cy"] * escala_origem_y, 1)
-                    ms_aruco = (time.time() - t_aruco) * 1000
-
-                    if robo["frontal"] or robo["traseiro"]:
-                        pacote_aruco = {
-                            "frame":           None,
-                            "bolas_px":        [],
-                            "robo_px":         robo,
-                            "indice":          indice,
-                            "timestamp_visao": pacote["timestamp"],
-                            "tipo":            "aruco_fast",
-                        }
-                        ok_fast = enviar_para_retificador(pacote_aruco, tentativas=1)
-                        if not ok_fast:
-                            log("DEBUG", f"Frame {indice:04d}: envio ArUco rápido falhou.")
+                    robo = {
+                        "frontal": None,
+                        "traseiro": None,
+                        "orientacao_graus": None,
+                    }
 
                     # ── Inferência YOLO (bolas) — saltada em disparo ───
                     bolas = []
@@ -523,27 +479,13 @@ def iniciar_visao():
                     else:
                         stats["frames_yolo_skip"] += 1
 
-                    # ── Log resumido ───────────────────────────────────
-                    robo_str = "—"
-                    if robo["frontal"] or robo["traseiro"]:
-                        partes = []
-                        if robo["frontal"]:
-                            partes.append("F~" if robo["frontal"].get("persistido") else "F✓")
-                        if robo["traseiro"]:
-                            partes.append("T~" if robo["traseiro"].get("persistido") else "T✓")
-                        if robo["orientacao_graus"] is not None:
-                            partes.append(f"{robo['orientacao_graus']:.1f}°")
-                        robo_str = " ".join(partes)
-                        stats["robo_detetado"] += 1
-
                     if skip_yolo:
                         log("DEBUG",
-                            f"Frame {indice:04d} [DISPARO — sem YOLO] | "
-                            f"robô={robo_str} [{ms_aruco:.0f}ms]")
+                            f"Frame {indice:04d} [DISPARO — sem YOLO]")
                     else:
                         log("DEBUG",
                             f"Frame {indice:04d} | bolas={len(bolas)} "
-                            f"[{ms_yolo:.0f}ms] | robô={robo_str} [{ms_aruco:.0f}ms]")
+                            f"[{ms_yolo:.0f}ms]")
 
                     frame_debug = None
                     agora_debug = time.time()
@@ -569,7 +511,6 @@ def iniciar_visao():
                             cv2.putText(frame_debug, label,
                                         (x1 + 2, ty),
                                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
-                        frame_debug = anotar_robo(frame_debug, robo)
 
                     # ── Encaminhar para retificador ─────────────────────
                     pacote_ret = {
@@ -580,15 +521,13 @@ def iniciar_visao():
                         "timestamp_visao": pacote["timestamp"],
                     }
 
-                    # Em disparo o robô tem de ser sempre enviado mesmo sem bolas.
-                    # Fora de disparo mantém-se a otimização: só envia se há dados.
-                    tem_dados = bolas or robo["frontal"] or robo["traseiro"] or frame_debug is not None
-                    if tem_dados or skip_yolo:
+                    tem_dados = bolas or frame_debug is not None
+                    if tem_dados:
                         ok = enviar_para_retificador(pacote_ret)
                         if not ok:
                             log("AVISO", f"Frame {indice:04d}: retificação falhou.")
                     else:
-                        log("DEBUG", f"Frame {indice:04d}: sem bolas nem robô — a ignorar.")
+                        log("DEBUG", f"Frame {indice:04d}: sem bolas — a ignorar.")
 
                     conn.send("LIBERADO")
 

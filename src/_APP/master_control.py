@@ -21,11 +21,13 @@ Câmara suportada:
 Health-checks (cada módulo abre o seu numa porta dedicada):
   6011  retificador
   6002  VisionProcessing
+  6004  ArUcoProcessor
   6013  GraphProcessor
   6014  RobotController
 
 Portas autenticadas (não tocar sem authkey):
-  6000  VisionProcessing ↔ imageStreaming
+  6000  VisionProcessing/YOLO ↔ imageStreaming
+  6003  ArUcoProcessor       ↔ imageStreaming
   6001  retificador      ↔ imageStreaming/calibração
   6020  retificador       → GraphProcessor (fila de JSONs)
   6021  GraphProcessor    → RobotController (broadcast de estado)
@@ -57,6 +59,7 @@ SCRIPTS = {
     "debug_console": BASE_PATH / "_TOOLS" / "debug_console.py",
     "camera_stream": BASE_PATH / "_VISION" / "camera_stream.py",
     "vision_processor": BASE_PATH / "_VISION" / "vision_processor.py",
+    "aruco_processor": BASE_PATH / "_VISION" / "aruco_processor.py",
     "court_rectifier": BASE_PATH / "_VISION" / "court_rectifier.py",
     "court_graph_processor": BASE_PATH / "_PLANNING" / "court_graph_processor.py",
     "robot_controller": BASE_PATH / "_CONTROL" / "robot_controller.py",
@@ -68,11 +71,13 @@ PASTA_CALIB_REF     = BASE_PATH / "resultados" / "calibracao"
 # Portas de health
 PORTA_RET_HEALTH      = 6011
 PORTA_VIS_HEALTH      = 6002
+PORTA_ARUCO_HEALTH    = 6004
 PORTA_GRAFO_HEALTH    = 6013
 PORTA_CONTROL_HEALTH  = 6014
 
 # Portas autenticadas
 PORTA_VIS         = 6000
+PORTA_ARUCO       = 6003
 PORTA_RET         = 6001
 PORTA_RET_GRAFO   = 6020
 PORTA_BROADCAST   = 6021
@@ -209,9 +214,9 @@ def _pids_a_ocupar_portas(portas: list[int]) -> set[int]:
 
 def matar_processos_pendentes():
     portas_alvo = [
-        PORTA_RET_HEALTH, PORTA_VIS_HEALTH,
+        PORTA_RET_HEALTH, PORTA_VIS_HEALTH, PORTA_ARUCO_HEALTH,
         PORTA_GRAFO_HEALTH, PORTA_CONTROL_HEALTH,
-        PORTA_VIS, PORTA_RET, PORTA_RET_GRAFO, PORTA_BROADCAST,
+        PORTA_VIS, PORTA_ARUCO, PORTA_RET, PORTA_RET_GRAFO, PORTA_BROADCAST,
         PORTA_DEBUG,
     ]
     log(MOD, "AVISO", "A verificar processos pendentes nas portas do pipeline...")
@@ -298,6 +303,7 @@ def fase_producao():
     separador("FASE 2 — PIPELINE DE PRODUÇÃO")
 
     if (porta_aberta(PORTA_RET_HEALTH) or porta_aberta(PORTA_VIS_HEALTH)
+        or porta_aberta(PORTA_ARUCO_HEALTH)
         or porta_aberta(PORTA_GRAFO_HEALTH) or porta_aberta(PORTA_CONTROL_HEALTH)):
         log(MOD, "AVISO", "Portas já ocupadas. A matar processos pendentes...")
         matar_processos_pendentes()
@@ -311,12 +317,19 @@ def fase_producao():
     if not aguardar_porta(PORTA_RET_HEALTH, "retificador"):
         encerrar_pipeline(processos, "retificador não respondeu")
 
-    log(MOD, "HUMANO", "A lançar processamento de visão...")
+    log(MOD, "HUMANO", "A lançar processamento ArUco...")
+    log(MOD, "DEBUG",  "health=6004 | socket autenticado=6003")
+    p_aruco = executar_modulo("aruco_processor")
+    processos.append(p_aruco)
+    if not aguardar_porta(PORTA_ARUCO_HEALTH, "ArUcoProcessor"):
+        encerrar_pipeline(processos, "ArUcoProcessor não respondeu")
+
+    log(MOD, "HUMANO", "A lançar processamento YOLO...")
     log(MOD, "DEBUG",  "health=6002 | socket autenticado=6000")
     p_vis = executar_modulo("vision_processor")
     processos.append(p_vis)
-    if not aguardar_porta(PORTA_VIS_HEALTH, "VisionProcessing"):
-        encerrar_pipeline(processos, "VisionProcessing não respondeu")
+    if not aguardar_porta(PORTA_VIS_HEALTH, "VisionProcessing/YOLO"):
+        encerrar_pipeline(processos, "VisionProcessing/YOLO não respondeu")
 
     log(MOD, "HUMANO", "A lançar GraphProcessor...")
     log(MOD, "DEBUG",  "health=6013 | cliente de 6020 | broadcaster em 6021")
