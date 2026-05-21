@@ -372,6 +372,26 @@ def _px_para_metros(cx: float, cy: float,
     return round(x_metros, 4), round(y_metros, 4)
 
 
+def _ancora_bola_px(b: dict, modo: str, altura_bola_m: float) -> tuple[float, float, float]:
+    """
+    Escolhe o ponto da bounding box que representa a posição da bola na quadra.
+
+    CENTER usa o centro da deteção e aplica correção de altura. Para câmara
+    lateral, BOTTOM_CENTER costuma ser mais fiel ao ponto de contacto com o
+    chão, portanto não aplica correção de altura.
+    """
+    x1, y1 = float(b["x1"]), float(b["y1"])
+    x2, y2 = float(b["x2"]), float(b["y2"])
+    cx = (x1 + x2) / 2.0
+    modo = str(modo or "BOTTOM_CENTER").upper()
+
+    if modo == "CENTER":
+        return cx, (y1 + y2) / 2.0, altura_bola_m
+    if modo == "LOWER_CENTER_80":
+        return cx, y1 + 0.80 * (y2 - y1), 0.0
+    return cx, y2, 0.0
+
+
 # ═════════════════════════════════════════════════════════════════════
 #  MODO CALIBRAÇÃO
 # ═════════════════════════════════════════════════════════════════════
@@ -416,35 +436,60 @@ def calibrar_via_socket():
         restam = n - len(pts_px)
         if restam > 0:
             header = (f"Marque {n} pontos | marcados: {len(pts_px)}/{n}  "
-                      f"|  D: apagar último  |  ESC: cancelar")
+                      f"|  D: apagar último  |  setas: ajuste fino")
         else:
-            header = "Todos os pontos marcados! Prima ENTER para continuar."
+            header = "Setas ajustam o ponto selecionado | N/P troca ponto | ENTER continua."
         cv2.putText(base, header,
                     (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.85,
                     (0, 255, 0) if restam == 0 else (0, 255, 255), 2)
         for idx0, (px, py) in enumerate(pts_px):
+            selecionado = idx0 == selected_idx
             cv2.drawMarker(
-                base, (px, py), (0, 0, 255),
+                base, (px, py), (0, 255, 255) if selecionado else (0, 0, 255),
                 markerType=cv2.MARKER_CROSS,
-                markerSize=18,
-                thickness=2,
+                markerSize=24 if selecionado else 18,
+                thickness=3 if selecionado else 2,
                 line_type=cv2.LINE_AA,
             )
             cv2.circle(base, (px, py), 4, (255, 255, 255), 1, cv2.LINE_AA)
             cv2.putText(base, str(idx0 + 1),
                         (px + 10, py - 8),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 0, 255), 2)
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.75,
+                        (0, 255, 255) if selecionado else (0, 0, 255), 2)
             cv2.putText(base, f"({px},{py})",
                         (px + 10, py + 17),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 200, 0), 1)
         cv2.imshow(JANELA, base)
         return base
 
+    selected_idx = None
+
     def on_clique(event, x, y, flags, param):
+        nonlocal selected_idx
         if event == cv2.EVENT_LBUTTONDOWN and len(pts_px) < n:
             pts_px.append((x, y))
+            selected_idx = len(pts_px) - 1
             log("DEBUG", f"Ponto {len(pts_px)}/{n} marcado em px=({x}, {y})")
             redesenhar_pontos()
+        elif event == cv2.EVENT_LBUTTONDOWN and pts_px:
+            selected_idx = min(
+                range(len(pts_px)),
+                key=lambda i: (pts_px[i][0] - x) ** 2 + (pts_px[i][1] - y) ** 2,
+            )
+            redesenhar_pontos()
+
+    def mover_ponto(dx: int, dy: int):
+        nonlocal selected_idx
+        if selected_idx is None or not (0 <= selected_idx < len(pts_px)):
+            if not pts_px:
+                return
+            selected_idx = len(pts_px) - 1
+        x, y = pts_px[selected_idx]
+        pts_px[selected_idx] = (
+            int(min(max(x + dx, 0), w_img - 1)),
+            int(min(max(y + dy, 0), h_img - 1)),
+        )
+        redesenhar_pontos()
 
     cv2.namedWindow(JANELA, cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO)
     try:
@@ -458,19 +503,43 @@ def calibrar_via_socket():
     log("HUMANO", f"Janela aberta. Marque os {n} pontos.")
     log("HUMANO", "  Clique esquerdo — adicionar ponto")
     log("HUMANO", "  Tecla D         — apagar último ponto")
+    log("HUMANO", "  Setas           — mover ponto selecionado 1 px")
+    log("HUMANO", "  N/P             — selecionar próximo/anterior ponto")
     log("HUMANO", "  ENTER           — confirmar (quando todos marcados)")
     log("HUMANO", "  ESC             — cancelar")
 
     while True:
-        key = cv2.waitKey(50) & 0xFF
-        if key == 13 and len(pts_px) == n:
+        key = cv2.waitKeyEx(50)
+        ascii_key = key & 0xFF
+        if key in (2424832, 81):
+            mover_ponto(-1, 0)
+            continue
+        if key in (2555904, 83):
+            mover_ponto(1, 0)
+            continue
+        if key in (2490368, 82):
+            mover_ponto(0, -1)
+            continue
+        if key in (2621440, 84):
+            mover_ponto(0, 1)
+            continue
+        if ascii_key in (ord("n"), ord("N")) and pts_px:
+            selected_idx = 0 if selected_idx is None else (selected_idx + 1) % len(pts_px)
+            redesenhar_pontos()
+            continue
+        if ascii_key in (ord("p"), ord("P")) and pts_px:
+            selected_idx = len(pts_px) - 1 if selected_idx is None else (selected_idx - 1) % len(pts_px)
+            redesenhar_pontos()
+            continue
+        if ascii_key == 13 and len(pts_px) == n:
             break
-        if key in (ord("d"), ord("D")) and pts_px:
+        if ascii_key in (ord("d"), ord("D")) and pts_px:
             removido = pts_px.pop()
+            selected_idx = len(pts_px) - 1 if pts_px else None
             log("AVISO", f"Ponto {len(pts_px) + 1} removido (px={removido}). "
                          f"Restam {len(pts_px)}/{n}.")
             redesenhar_pontos()
-        if key == 27:
+        if ascii_key == 27:
             log("AVISO", "Calibração cancelada pelo utilizador (ESC).")
             cv2.destroyAllWindows()
             sys.exit(1)
@@ -819,12 +888,14 @@ def servidor_producao(calib: dict):
     altura_camara_m = float(cfg.get("altura_camara_m", 0.0))
     altura_bola_m   = float(cfg.get("altura_bola_m",   0.0))
     altura_aruco_m  = float(cfg.get("altura_aruco_m",  0.0))
+    bola_ancora_px  = str(cfg.get("bola_ancora_px", "BOTTOM_CENTER")).upper()
     guardar_disco   = bool(int(cfg.get("guardar_resultados_disco", 0)))
-    guardar_imagens = guardar_disco and bool(int(cfg.get("guardar_imagens_debug", 0)))
+    guardar_imagens = bool(int(cfg.get("guardar_imagens_debug", 0)))
     intervalo_guardar_imagens_s = float(cfg.get("intervalo_guardar_imagens_s", 5.0))
 
     log("DEBUG", f"Correção de paralaxe: câmara={altura_camara_m:.2f}m | "
-                 f"bola={altura_bola_m*100:.1f}cm | ArUco={altura_aruco_m*100:.1f}cm")
+                 f"bola={altura_bola_m*100:.1f}cm | ArUco={altura_aruco_m*100:.1f}cm | "
+                 f"âncora bola={bola_ancora_px}")
 
     # Aviso se os parâmetros de câmara mudaram desde a calibração
     perfil_calib = calib.get("perfil_camara")
@@ -860,6 +931,9 @@ def servidor_producao(calib: dict):
     if guardar_disco:
         _iniciar_worker_escrita()
         log("DEBUG", "Worker de escrita assíncrona iniciado.")
+    elif guardar_imagens:
+        _iniciar_worker_escrita()
+        log("DEBUG", "Worker de escrita assíncrona iniciado para imagens.")
 
     log("HUMANO", "Retificador pronto. A aguardar pacotes do VisionProcessing...")
     log("DEBUG",  f"Calibração: ppm={ppm:.1f} | erro médio={calib.get('erro_medio_m','?')}m")
@@ -887,11 +961,11 @@ def servidor_producao(calib: dict):
                     # ── Retificar bolas (com correção de paralaxe) ─────────
                     res_bolas = []
                     for b in bolas_px:
-                        cx = (b["x1"] + b["x2"]) / 2.0
-                        cy = (b["y1"] + b["y2"]) / 2.0
+                        cx, cy, altura_bola_ponto_m = _ancora_bola_px(
+                            b, bola_ancora_px, altura_bola_m)
                         xm, ym = _px_para_metros(
                             cx, cy, H, ppm, x_min, y_min, K, D,
-                            altura_objeto_m=altura_bola_m,
+                            altura_objeto_m=altura_bola_ponto_m,
                             altura_camara_m=altura_camara_m,
                             H_metros=H_metros,
                         )

@@ -74,6 +74,8 @@ CLAHE_CLIP     = 2.0
 CLAHE_GRID     = (8, 8)
 ARUCO_LARGURA_PX = 640
 ARUCO_USAR_CLAHE = False
+ARUCO_PERSISTENCIA_S = 0.35
+ARUCO_SUAVIZACAO = 0.35
 
 
 # ─────────────────────────────────────────────
@@ -177,15 +179,76 @@ def criar_detetor_aruco():
     parameters = cv2.aruco.DetectorParameters()
 
     parameters.adaptiveThreshWinSizeMin   = 3
-    parameters.adaptiveThreshWinSizeMax   = 53
+    parameters.adaptiveThreshWinSizeMax   = 83
     parameters.adaptiveThreshWinSizeStep  = 4
-    parameters.minMarkerPerimeterRate     = 0.02
+    parameters.adaptiveThreshConstant     = 7
+    parameters.minMarkerPerimeterRate     = 0.01
     parameters.maxMarkerPerimeterRate     = 4.0
     parameters.polygonalApproxAccuracyRate = 0.05
+    parameters.cornerRefinementMethod     = cv2.aruco.CORNER_REFINE_SUBPIX
+    parameters.cornerRefinementWinSize    = 5
+    parameters.cornerRefinementMaxIterations = 30
+    parameters.cornerRefinementMinAccuracy = 0.05
+    parameters.errorCorrectionRate        = 0.7
 
     detector = cv2.aruco.ArucoDetector(dictionary, parameters)
     log("HUMANO", f"Detetor ArUco pronto (IDs {ID_FRONTAL}=frente, {ID_TRASEIRO}=trás).")
     return detector
+
+
+class PersistenciaAruco:
+    """Mantém a última pose ArUco por alguns frames para evitar flicker."""
+
+    def __init__(self, persistencia_s: float, suavizacao: float):
+        self.persistencia_s = max(0.0, float(persistencia_s))
+        self.suavizacao = min(max(float(suavizacao), 0.0), 0.95)
+        self._ultimo = {
+            "frontal": None,
+            "traseiro": None,
+        }
+        self._t_ultimo = {
+            "frontal": 0.0,
+            "traseiro": 0.0,
+        }
+        self._orientacao = None
+
+    def atualizar(self, det: dict, agora: float | None = None) -> dict:
+        agora = time.time() if agora is None else agora
+        saida = {
+            "frontal": None,
+            "traseiro": None,
+            "orientacao_graus": None,
+        }
+
+        for chave in ("frontal", "traseiro"):
+            pos = det.get(chave)
+            if pos:
+                anterior = self._ultimo.get(chave)
+                if anterior:
+                    a = self.suavizacao
+                    pos = {
+                        "cx": round(anterior["cx"] * a + pos["cx"] * (1.0 - a), 1),
+                        "cy": round(anterior["cy"] * a + pos["cy"] * (1.0 - a), 1),
+                    }
+                self._ultimo[chave] = pos
+                self._t_ultimo[chave] = agora
+                saida[chave] = dict(pos)
+            else:
+                anterior = self._ultimo.get(chave)
+                if anterior and (agora - self._t_ultimo[chave]) <= self.persistencia_s:
+                    saida[chave] = {**anterior, "persistido": True}
+
+        if saida["frontal"] and saida["traseiro"]:
+            dx = saida["frontal"]["cx"] - saida["traseiro"]["cx"]
+            dy = saida["frontal"]["cy"] - saida["traseiro"]["cy"]
+            self._orientacao = round(float(np.degrees(np.arctan2(-dy, dx))), 2)
+            saida["orientacao_graus"] = self._orientacao
+        elif self._orientacao is not None:
+            mais_recente = max(self._t_ultimo.values())
+            if (agora - mais_recente) <= self.persistencia_s:
+                saida["orientacao_graus"] = self._orientacao
+
+        return saida
 
 
 def detetar_robo(frame_gray, detector, clahe=None, escala_saida: float = 1.0) -> dict:
@@ -199,8 +262,18 @@ def detetar_robo(frame_gray, detector, clahe=None, escala_saida: float = 1.0) ->
         "orientacao_graus": None,
     }
 
-    frame_proc = clahe.apply(frame_gray) if clahe is not None else frame_gray
-    corners, ids, _ = detector.detectMarkers(frame_proc)
+    candidatos = [frame_gray]
+    if clahe is not None:
+        candidatos.append(clahe.apply(frame_gray))
+    candidatos.append(cv2.equalizeHist(frame_gray))
+
+    corners = ids = None
+    for frame_proc in candidatos:
+        corners, ids, _ = detector.detectMarkers(frame_proc)
+        if ids is not None:
+            ids_set = set(int(v) for v in ids.flatten())
+            if ID_FRONTAL in ids_set or ID_TRASEIRO in ids_set:
+                break
 
     if ids is None:
         return resultado
@@ -292,15 +365,15 @@ def enviar_para_retificador(pacote_ret: dict, tentativas: int = 3) -> bool:
 #  SERVIDOR PRINCIPAL
 # ─────────────────────────────────────────────
 def iniciar_visao():
-    global ARUCO_LARGURA_PX, ARUCO_USAR_CLAHE
+    global ARUCO_LARGURA_PX, ARUCO_USAR_CLAHE, ARUCO_PERSISTENCIA_S, ARUCO_SUAVIZACAO
     cfg = _params.carregar()
-    enviar_frame_debug = bool(int(cfg.get("guardar_resultados_disco", 0))) and bool(
-        int(cfg.get("guardar_imagens_debug", 0))
-    )
+    enviar_frame_debug = bool(int(cfg.get("guardar_imagens_debug", 0)))
     intervalo_frame_debug_s = float(cfg.get("intervalo_guardar_imagens_s", 5.0))
     proximo_frame_debug = 0.0
     ARUCO_LARGURA_PX = int(cfg.get("aruco_largura_px", ARUCO_LARGURA_PX))
     ARUCO_USAR_CLAHE = bool(int(cfg.get("aruco_usar_clahe", 0)))
+    ARUCO_PERSISTENCIA_S = float(cfg.get("aruco_persistencia_s", ARUCO_PERSISTENCIA_S))
+    ARUCO_SUAVIZACAO = float(cfg.get("aruco_suavizacao", ARUCO_SUAVIZACAO))
 
     # ── Carregar modelo YOLO ───────────────────────────────
     log("HUMANO", "A carregar modelo YOLO...")
@@ -327,6 +400,7 @@ def iniciar_visao():
     aruco_detector = criar_detetor_aruco()
     clahe = (cv2.createCLAHE(clipLimit=CLAHE_CLIP, tileGridSize=CLAHE_GRID)
              if ARUCO_USAR_CLAHE else None)
+    persistencia_aruco = PersistenciaAruco(ARUCO_PERSISTENCIA_S, ARUCO_SUAVIZACAO)
 
     # ── Health-server ──────────────────────────────────────
     iniciar_health_server()
@@ -347,7 +421,8 @@ def iniciar_visao():
     log("HUMANO", "VisionProcessing pronto. A aguardar frames...")
     log("DEBUG",  f"servidor ativo na porta {PORTA_ENTRADA}")
     log("DEBUG",  f"envio de frames para escrita/debug={'ON' if enviar_frame_debug else 'OFF'}")
-    log("DEBUG",  f"ArUco: largura={ARUCO_LARGURA_PX}px | CLAHE={'ON' if ARUCO_USAR_CLAHE else 'OFF'}")
+    log("DEBUG",  f"ArUco: largura={ARUCO_LARGURA_PX}px | CLAHE={'ON' if ARUCO_USAR_CLAHE else 'OFF'} | "
+                  f"persistência={ARUCO_PERSISTENCIA_S:.2f}s | suavização={ARUCO_SUAVIZACAO:.2f}")
 
     address = ("localhost", PORTA_ENTRADA)
     with Listener(address, authkey=AUTHKEY_VIS) as listener:
@@ -423,10 +498,11 @@ def iniciar_visao():
                             interpolation=cv2.INTER_AREA,
                         )
                     gray = cv2.cvtColor(frame_aruco, cv2.COLOR_BGR2GRAY)
-                    robo = detetar_robo(
+                    robo_det = detetar_robo(
                         gray, aruco_detector, clahe,
                         escala_saida=escala_aruco,
                     )
+                    robo = persistencia_aruco.atualizar(robo_det)
                     for chave in ("frontal", "traseiro"):
                         if robo.get(chave):
                             robo[chave]["cx"] = round(robo[chave]["cx"] * escala_origem_x, 1)
@@ -437,8 +513,10 @@ def iniciar_visao():
                     robo_str = "—"
                     if robo["frontal"] or robo["traseiro"]:
                         partes = []
-                        if robo["frontal"]:  partes.append("F✓")
-                        if robo["traseiro"]: partes.append("T✓")
+                        if robo["frontal"]:
+                            partes.append("F~" if robo["frontal"].get("persistido") else "F✓")
+                        if robo["traseiro"]:
+                            partes.append("T~" if robo["traseiro"].get("persistido") else "T✓")
                         if robo["orientacao_graus"] is not None:
                             partes.append(f"{robo['orientacao_graus']:.1f}°")
                         robo_str = " ".join(partes)
@@ -490,7 +568,7 @@ def iniciar_visao():
 
                     # Em disparo o robô tem de ser sempre enviado mesmo sem bolas.
                     # Fora de disparo mantém-se a otimização: só envia se há dados.
-                    tem_dados = bolas or robo["frontal"] or robo["traseiro"]
+                    tem_dados = bolas or robo["frontal"] or robo["traseiro"] or frame_debug is not None
                     if tem_dados or skip_yolo:
                         ok = enviar_para_retificador(pacote_ret)
                         if not ok:
