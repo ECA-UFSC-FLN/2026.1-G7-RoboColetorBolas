@@ -173,24 +173,95 @@ def preparar_frame_producao(frame, largura_alvo: int) -> tuple:
     return pequeno, w / float(largura_alvo), h / float(novo_h)
 
 
+def enfileirar_mais_recente(fila: Queue, pacote: dict) -> bool:
+    try:
+        fila.put_nowait(pacote)
+        return False
+    except Full:
+        substituiu = False
+        try:
+            fila.get_nowait()
+            fila.task_done()
+            substituiu = True
+        except Empty:
+            pass
+        try:
+            fila.put_nowait(pacote)
+            return substituiu
+        except Full:
+            return True
+
+
 def worker_envio(fila: Queue, stats: dict, parar: threading.Event,
                  porta: int, authkey: bytes, nome: str, chave_stats: str):
+    sufixo_stats = chave_stats.replace("enviados_", "")
+    chave_janela = f"envios_janela_{sufixo_stats}"
+
+    if nome != "ArUcoProcessor":
+        while not parar.is_set():
+            try:
+                pacote = fila.get(timeout=0.1)
+            except Empty:
+                continue
+
+            resultado = enviar_para_servico(pacote, porta, authkey, nome)
+            if resultado is None:
+                stats["vision_offline"] = True
+                parar.set()
+            elif resultado:
+                stats[chave_stats] += 1
+                stats["envios_janela"] += 1
+                stats[chave_janela] += 1
+            else:
+                stats["erros"] += 1
+            fila.task_done()
+        return
+
     while not parar.is_set():
         try:
-            pacote = fila.get(timeout=0.1)
-        except Empty:
-            continue
-
-        resultado = enviar_para_servico(pacote, porta, authkey, nome)
-        if resultado is None:
+            conn = Client(("localhost", porta), authkey=authkey)
+            log("DEBUG", f"Ligação persistente a {nome} ativa.")
+        except ConnectionRefusedError:
+            log("ERRO", f"{nome} desligou. A encerrar loop de produção.")
             stats["vision_offline"] = True
             parar.set()
-        elif resultado:
-            stats[chave_stats] += 1
-            stats["envios_janela"] += 1
-        else:
+            break
+        except Exception as e:
+            log("ERRO", f"Erro ao ligar a {nome}: {e}")
             stats["erros"] += 1
-        fila.task_done()
+            time.sleep(0.3)
+            continue
+
+        try:
+            while not parar.is_set():
+                try:
+                    pacote = fila.get(timeout=0.1)
+                except Empty:
+                    continue
+
+                try:
+                    conn.send(pacote)
+                    resposta = conn.recv()
+                    if resposta == "LIBERADO":
+                        stats[chave_stats] += 1
+                        stats["envios_janela"] += 1
+                        stats[chave_janela] += 1
+                    else:
+                        stats["erros"] += 1
+                except (EOFError, BrokenPipeError, ConnectionResetError, OSError):
+                    stats["erros"] += 1
+                    log("AVISO", f"Ligação persistente a {nome} caiu. A reabrir...")
+                    break
+                except Exception as e:
+                    stats["erros"] += 1
+                    log("ERRO", f"Erro ao enviar para {nome}: {e}")
+                finally:
+                    fila.task_done()
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
 # ─────────────────────────────────────────────
@@ -217,7 +288,7 @@ def enviar_para_calibracao(frame) -> bool:
 def desenhar_overlay(frame, stats: dict, modo: str, pausado: bool):
     h, w = frame.shape[:2]
     overlay = frame.copy()
-    cv2.rectangle(overlay, (0, 0), (w, 65), (0, 0, 0), -1)
+    cv2.rectangle(overlay, (0, 0), (min(w, 760), 88), (0, 0, 0), -1)
     cv2.addWeighted(overlay, 0.45, frame, 0.55, 0, frame)
 
     if modo == "CALIBRACAO":
@@ -228,21 +299,25 @@ def desenhar_overlay(frame, stats: dict, modo: str, pausado: bool):
         cor_modo = (0, 255, 120)
 
     cv2.putText(frame, teclas,
-                (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (200, 200, 200), 1)
+                (10, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.46, (200, 200, 200), 1)
 
     estado_modo = f"MODO: {modo}"
     if modo == "PRODUCAO" and pausado:
         estado_modo += "  [PAUSADO]"
     cv2.putText(frame, estado_modo,
-                (10, 45), cv2.FONT_HERSHEY_SIMPLEX, 0.55, cor_modo, 1)
+                (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.50, cor_modo, 1)
 
-    info = (f"Aruco/Yolo: {stats.get('enviados_aruco', 0)}/{stats.get('enviados_yolo', 0)}  |  "
-            f"Erros: {stats['erros']}  |  "
-            f"Drop A/Y: {stats.get('drop_aruco', 0)}/{stats.get('drop_yolo', 0)}  |  "
-            f"FPS captura: {stats.get('fps', 0.0):.1f}  |  "
-            f"FPS envio: {stats.get('fps_envio', 0.0):.2f}")
-    cv2.putText(frame, info,
-                (w // 2 - 100, 45), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (180, 220, 180), 1)
+    linha_1 = (f"Captura {stats.get('fps', 0.0):.1f} FPS  |  "
+               f"Envio A/Y {stats.get('fps_envio_aruco', 0.0):.1f}/"
+               f"{stats.get('fps_envio_yolo', 0.0):.1f} Hz")
+    linha_2 = (f"Frames A/Y {stats.get('enviados_aruco', 0)}/"
+               f"{stats.get('enviados_yolo', 0)}  |  "
+               f"Drop A/Y {stats.get('drop_aruco', 0)}/"
+               f"{stats.get('drop_yolo', 0)}  |  Erros {stats['erros']}")
+    cv2.putText(frame, linha_1,
+                (10, 62), cv2.FONT_HERSHEY_SIMPLEX, 0.47, (180, 240, 190), 1)
+    cv2.putText(frame, linha_2,
+                (10, 82), cv2.FONT_HERSHEY_SIMPLEX, 0.43, (180, 220, 180), 1)
 
     return frame
 
@@ -253,6 +328,7 @@ def desenhar_overlay(frame, stats: dict, modo: str, pausado: bool):
 def stream():
     cfg = _params.carregar()
     largura_processamento = int(cfg.get("processamento_largura_px", 960))
+    largura_aruco_envio = int(cfg.get("aruco_largura_px", 640))
     enviar_debug_original = bool(int(cfg.get("guardar_imagens_debug", 0)))
     intervalo_debug_original_s = float(cfg.get("intervalo_guardar_imagens_s", 5.0))
 
@@ -293,6 +369,8 @@ def stream():
 
     cap.set(cv2.CAP_PROP_FRAME_WIDTH,  1920)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
+    cap.set(cv2.CAP_PROP_FPS, 30)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
     w_real = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     h_real = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     log("HUMANO", f"Câmara pronta ({w_real}×{h_real}px).")
@@ -324,7 +402,9 @@ def stream():
     stats   = {
         "enviados": 0, "enviados_aruco": 0, "enviados_yolo": 0,
         "erros": 0, "fps": 0.0, "fps_envio": 0.0,
-        "envios_janela": 0, "drop_aruco": 0, "drop_yolo": 0,
+        "fps_envio_aruco": 0.0, "fps_envio_yolo": 0.0,
+        "envios_janela": 0, "envios_janela_aruco": 0, "envios_janela_yolo": 0,
+        "drop_aruco": 0, "drop_yolo": 0,
         "vision_offline": False,
     }
     pausado = False
@@ -353,6 +433,8 @@ def stream():
         ).start()
         log("DEBUG", f"Processamento: largura={largura_processamento}px "
                      f"(0 = resolução original).")
+        log("DEBUG", f"ArUco: largura de envio={largura_aruco_envio}px "
+                     f"(0 = resolução original).")
 
     while True:
         ret, frame = cap.read()
@@ -373,7 +455,11 @@ def stream():
         dt_e = time.time() - t_envios
         if dt_e >= 5.0:
             stats["fps_envio"] = stats["envios_janela"] / dt_e
+            stats["fps_envio_aruco"] = stats["envios_janela_aruco"] / dt_e
+            stats["fps_envio_yolo"] = stats["envios_janela_yolo"] / dt_e
             stats["envios_janela"] = 0
+            stats["envios_janela_aruco"] = 0
+            stats["envios_janela_yolo"] = 0
             t_envios = time.time()
 
         preview = desenhar_overlay(frame.copy(), stats, modo, pausado)
@@ -389,7 +475,9 @@ def stream():
             log("DEBUG", f"Modo={modo} | Câmera={w_real}×{h_real}px | "
                         f"ArUco={stats['enviados_aruco']} | YOLO={stats['enviados_yolo']} | "
                         f"Erros={stats['erros']} | "
-                        f"FPS captura={stats['fps']:.1f} | FPS envio={stats['fps_envio']:.2f}")
+                        f"FPS captura={stats['fps']:.1f} | "
+                        f"Envio A/Y={stats['fps_envio_aruco']:.1f}/"
+                        f"{stats['fps_envio_yolo']:.1f}")
 
         # ══════════════════════════════════════════════════
         #  MODO CALIBRAÇÃO — tecla C captura e envia
@@ -419,30 +507,40 @@ def stream():
                     log("AVISO", "Serviço de visão indisponível. A encerrar.")
                     break
 
-                frame_proc, sx, sy = preparar_frame_producao(
-                    frame, largura_processamento
-                )
                 agora_pacote = time.time()
-                pacote_base = {
-                    "frame": frame_proc,
+
+                frame_aruco, sx_aruco, sy_aruco = preparar_frame_producao(
+                    frame, largura_aruco_envio
+                )
+                frame_aruco = cv2.cvtColor(frame_aruco, cv2.COLOR_BGR2GRAY)
+                indice_atual = indice_envio
+                indice_envio += 1
+                pacote_aruco = {
+                    "frame": frame_aruco,
+                    "frame_gray": True,
                     "timestamp": agora_pacote,
                     "nome": "cam_principal",
-                    "escala_origem_x": sx,
-                    "escala_origem_y": sy,
+                    "escala_origem_x": sx_aruco,
+                    "escala_origem_y": sy_aruco,
                     "resolucao_original": [w_real, h_real],
-                    "indice": indice_envio,
+                    "indice": indice_atual,
                 }
-                indice_envio += 1
-
-                if fila_aruco.empty():
-                    try:
-                        fila_aruco.put_nowait(dict(pacote_base))
-                    except Full:
-                        stats["drop_aruco"] += 1
-                else:
+                if enfileirar_mais_recente(fila_aruco, pacote_aruco):
                     stats["drop_aruco"] += 1
 
                 if fila_yolo.empty():
+                    frame_proc, sx, sy = preparar_frame_producao(
+                        frame, largura_processamento
+                    )
+                    pacote_base = {
+                        "frame": frame_proc,
+                        "timestamp": agora_pacote,
+                        "nome": "cam_principal",
+                        "escala_origem_x": sx,
+                        "escala_origem_y": sy,
+                        "resolucao_original": [w_real, h_real],
+                        "indice": indice_atual,
+                    }
                     pacote_yolo = dict(pacote_base)
                     if enviar_debug_original and agora_pacote >= proximo_debug_original:
                         pacote_yolo["frame_debug_original"] = frame.copy()

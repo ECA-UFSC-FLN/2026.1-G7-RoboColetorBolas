@@ -9,7 +9,7 @@ criado automaticamente com os defaults.
 Categorias e respetivos parâmetros (25 no total):
 
   CAMARA
-    perfil_camara             "IPHONE16_1X" | "IPHONE16_05X" | "EXTERNO"
+    perfil_camara             "IPHONE16_1X" | "IPHONE16_05X" | "SAMSUNG_S25_PLUS_1X" | "SAMSUNG_S25_PLUS_UW" | "EXTERNO"
     altura_camara_m           altura da câmara ao solo (m)
     altura_bola_m             raio da bola de ténis = 0.0325 m (para correção de paralaxe)
     altura_aruco_m            altura dos marcadores ArUco ao solo (m) (topo do robô)
@@ -94,6 +94,39 @@ PERFIS_INTRINSICOS = {
     "IPHONE16_05X": (_IPHONE16_05X_K, _IPHONE16_05X_D, _IPHONE16_05X_RES),
 }
 
+# Samsung Galaxy S25 Plus — perfis aproximados.
+# A câmara principal é 50 MP, 24 mm eq.; a ultrawide é 12 MP, 13 mm eq.
+# Estes valores são bons para selecionar rapidamente o telemóvel no sistema,
+# mas a opção "CALIBRADO" continua a ser preferível para máxima precisão.
+_SAMSUNG_S25_PLUS_1X_K = [
+    [5375.0,    0.0, 2040.0],
+    [   0.0, 5375.0, 1530.0],
+    [   0.0,    0.0,    1.0],
+]
+_SAMSUNG_S25_PLUS_1X_D = [0.10, -0.22, 0.0001, -0.0002, 0.15]
+_SAMSUNG_S25_PLUS_1X_RES = [4080, 3060]
+
+_SAMSUNG_S25_PLUS_UW_K = [
+    [2910.0,    0.0, 2000.0],
+    [   0.0, 2910.0, 1500.0],
+    [   0.0,    0.0,    1.0],
+]
+_SAMSUNG_S25_PLUS_UW_D = [0.28, -0.62, 0.0003, -0.0005, 0.44]
+_SAMSUNG_S25_PLUS_UW_RES = [4000, 3000]
+
+PERFIS_INTRINSICOS.update({
+    "SAMSUNG_S25_PLUS_1X": (
+        _SAMSUNG_S25_PLUS_1X_K,
+        _SAMSUNG_S25_PLUS_1X_D,
+        _SAMSUNG_S25_PLUS_1X_RES,
+    ),
+    "SAMSUNG_S25_PLUS_UW": (
+        _SAMSUNG_S25_PLUS_UW_K,
+        _SAMSUNG_S25_PLUS_UW_D,
+        _SAMSUNG_S25_PLUS_UW_RES,
+    ),
+})
+
 
 # ─────────────────────────────────────────────
 #  ESQUEMA DOS PARÂMETROS
@@ -104,13 +137,20 @@ ESQUEMA: list[dict] = [
     {
         "chave":     "perfil_camara",
         "categoria": "CAMARA",
-        "descricao": "Perfil de câmara: iPhone 16 1×, iPhone 16 0.5×, calibrado, ou câmara externa configurável",
+        "descricao": "Perfil de câmara: iPhone 16, Samsung S25 Plus, calibrado, ou câmara externa configurável",
         "unidade":   "",
         "default":   "IPHONE16_1X",
         "tipo":      "str",
         "min":       None,
         "max":       None,
-        "opcoes":    ["IPHONE16_1X", "IPHONE16_05X", "CALIBRADO", "EXTERNO"],
+        "opcoes":    [
+            "IPHONE16_1X",
+            "IPHONE16_05X",
+            "SAMSUNG_S25_PLUS_1X",
+            "SAMSUNG_S25_PLUS_UW",
+            "CALIBRADO",
+            "EXTERNO",
+        ],
     },
     {
         "chave":     "altura_camara_m",
@@ -523,7 +563,7 @@ ESQUEMA: list[dict] = [
         "categoria": "PERFORMANCE",
         "descricao": "Largura interna usada só para deteção ArUco (0 usa frame recebido)",
         "unidade":   "px",
-        "default":   960,
+        "default":   640,
         "tipo":      "int",
         "min":       0,
         "max":       3840,
@@ -533,7 +573,7 @@ ESQUEMA: list[dict] = [
         "categoria": "PERFORMANCE",
         "descricao": "Aplicar CLAHE antes do ArUco (0=mais rápido, 1=mais robusto com má iluminação)",
         "unidade":   "",
-        "default":   1,
+        "default":   0,
         "tipo":      "int",
         "min":       0,
         "max":       1,

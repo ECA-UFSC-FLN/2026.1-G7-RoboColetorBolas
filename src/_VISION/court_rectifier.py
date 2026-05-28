@@ -41,6 +41,7 @@ import time
 import socket
 import threading
 import queue
+from collections import deque
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -189,7 +190,39 @@ def corrigir_altura_px(cx: float, cy: float,
 # ─────────────────────────────────────────────
 #  FILA PARA O GRAPH PROCESSOR
 # ─────────────────────────────────────────────
-_fila_grafo: queue.Queue = queue.Queue(maxsize=500)
+_fila_grafo: queue.Queue = queue.Queue(maxsize=80)
+
+
+def _enfileirar_grafo(pacote: dict) -> bool:
+    """
+    Envia dados ao GraphProcessor sem deixar poses ArUco antigas acumularem.
+    Para controlo interessa a última pose do robô, não o histórico atrasado.
+    """
+    if pacote.get("tipo") == "aruco":
+        with _fila_grafo.mutex:
+            antigos = len(_fila_grafo.queue)
+            _fila_grafo.queue = deque(
+                p for p in _fila_grafo.queue
+                if not (isinstance(p, dict) and p.get("tipo") == "aruco")
+            )
+            removidos = antigos - len(_fila_grafo.queue)
+            _fila_grafo.unfinished_tasks = max(
+                0, _fila_grafo.unfinished_tasks - removidos
+            )
+            _fila_grafo.not_full.notify_all()
+
+    try:
+        _fila_grafo.put_nowait(pacote)
+        return True
+    except queue.Full:
+        try:
+            _fila_grafo.get_nowait()
+            _fila_grafo.task_done()
+            _fila_grafo.put_nowait(pacote)
+            log("AVISO", "Fila do grafo cheia — descartado pacote mais antigo.")
+            return True
+        except Exception:
+            return False
 
 
 # ─────────────────────────────────────────────
@@ -947,153 +980,154 @@ def servidor_producao(calib: dict):
     total_bolas  = 0
     proxima_imagem_debug = 0.0
 
-    address = ("localhost", PORTA)
-    with Listener(address, authkey=AUTHKEY) as listener:
-        while True:
-            with listener.accept() as conn:
+    def _processar_pacote_producao(conn, pacote: dict):
+        nonlocal total_frames, total_bolas, proxima_imagem_debug
+
+        indice   = pacote["indice"]
+        bolas_px = pacote["bolas_px"]
+        robo_px  = pacote.get("robo_px", {})
+        frame    = pacote["frame"]
+
+        # ── Retificar bolas (com correção de paralaxe) ─────────
+        res_bolas = []
+        for b in bolas_px:
+            cx, cy, altura_bola_ponto_m = _ancora_bola_px(
+                b, bola_ancora_px, altura_bola_m)
+            xm, ym = _px_para_metros(
+                cx, cy, H, ppm, x_min, y_min, K, D,
+                altura_objeto_m=altura_bola_ponto_m,
+                altura_camara_m=altura_camara_m,
+                H_metros=H_metros,
+            )
+            res_bolas.append({"x": xm, "y": ym})
+
+        # ── Retificar robô/ArUco (com correção de paralaxe) ────
+        res_robo = {
+            "frontal":          None,
+            "traseiro":         None,
+            "orientacao_graus": robo_px.get("orientacao_graus"),
+        }
+        if robo_px.get("frontal"):
+            xm, ym = _px_para_metros(
+                robo_px["frontal"]["cx"], robo_px["frontal"]["cy"],
+                H, ppm, x_min, y_min, K, D,
+                altura_objeto_m=altura_aruco_m,
+                altura_camara_m=altura_camara_m,
+                H_metros=H_metros,
+            )
+            res_robo["frontal"] = {"x": xm, "y": ym}
+        if robo_px.get("traseiro"):
+            xm, ym = _px_para_metros(
+                robo_px["traseiro"]["cx"], robo_px["traseiro"]["cy"],
+                H, ppm, x_min, y_min, K, D,
+                altura_objeto_m=altura_aruco_m,
+                altura_camara_m=altura_camara_m,
+                H_metros=H_metros,
+            )
+            res_robo["traseiro"] = {"x": xm, "y": ym}
+
+        robo_log = "—"
+        if res_robo["frontal"] or res_robo["traseiro"]:
+            partes = []
+            if res_robo["frontal"]:
+                f = res_robo["frontal"]
+                partes.append(f"F({f['x']:.2f},{f['y']:.2f})")
+            if res_robo["traseiro"]:
+                t = res_robo["traseiro"]
+                partes.append(f"T({t['x']:.2f},{t['y']:.2f})")
+            if res_robo["orientacao_graus"] is not None:
+                partes.append(f"{res_robo['orientacao_graus']:.1f}°")
+            robo_log = " ".join(partes)
+
+        latencia = round((time.time() - pacote["timestamp_visao"]) * 1000, 2)
+        saida = {
+            "indice":      indice,
+            "tipo":        pacote.get("tipo", "vision"),
+            "latencia_ms": latencia,
+            "n_bolas":     len(res_bolas),
+            "trajetoria":  res_bolas,
+            "robo":        res_robo,
+        }
+        saida_serializavel = numpy_para_python(saida)
+
+        _enfileirar_grafo(saida_serializavel)
+        conn.send("LIBERADO")
+
+        if guardar_disco:
+            fich_json = PASTA_POSICOES / f"posicao_{indice:04d}.json"
+            _tentar_enfileirar_escrita({
+                "tipo":    "json",
+                "caminho": str(fich_json),
+                "dados":   saida_serializavel,
+            })
+
+        agora_img = time.time()
+        deve_guardar_imagem = (
+            guardar_imagens
+            and frame is not None
+            and hasattr(frame, "shape")
+            and agora_img >= proxima_imagem_debug
+        )
+        if deve_guardar_imagem:
+            proxima_imagem_debug = agora_img + intervalo_guardar_imagens_s
+            fich_img = PASTA_IMAGENS / f"frame_{indice:04d}.jpg"
+            _tentar_enfileirar_escrita({
+                "tipo":      "jpeg",
+                "caminho":   str(fich_img),
+                "frame":     frame,
+                "qualidade": 90,
+            })
+
+            fich_img_td = PASTA_IMAGENS_TD / f"frame_{indice:04d}.jpg"
+            _tentar_enfileirar_escrita({
+                "tipo":      "topdown",
+                "caminho":   str(fich_img_td),
+                "frame":     frame,
+                "H":         H,
+                "out_w":     out_w_px,
+                "out_h":     out_h_px,
+                "K":         K,
+                "D":         D,
+                "qualidade": 90,
+            })
+
+        total_frames += 1
+        total_bolas  += len(res_bolas)
+        tipo_pacote = saida_serializavel.get("tipo", "vision")
+        if tipo_pacote != "aruco" or total_frames % 25 == 0:
+            log("DEBUG",
+                f"Frame {indice:04d} | {len(res_bolas)} bola(s) | "
+                f"robô={robo_log} | latência={latencia}ms | total={total_frames} frames")
+        if total_frames % 50 == 0:
+            log("HUMANO",
+                f"{total_frames} frames processados "
+                f"({total_bolas} bolas no total).")
+
+    def _servir_conexao_producao(conn):
+        with conn:
+            while True:
                 try:
-                    pacote   = conn.recv()
-                    indice   = pacote["indice"]
-                    bolas_px = pacote["bolas_px"]
-                    robo_px  = pacote.get("robo_px", {})
-                    frame    = pacote["frame"]
-
-                    # ── Retificar bolas (com correção de paralaxe) ─────────
-                    res_bolas = []
-                    for b in bolas_px:
-                        cx, cy, altura_bola_ponto_m = _ancora_bola_px(
-                            b, bola_ancora_px, altura_bola_m)
-                        xm, ym = _px_para_metros(
-                            cx, cy, H, ppm, x_min, y_min, K, D,
-                            altura_objeto_m=altura_bola_ponto_m,
-                            altura_camara_m=altura_camara_m,
-                            H_metros=H_metros,
-                        )
-                        res_bolas.append({"x": xm, "y": ym})
-
-                    # ── Retificar robô/ArUco (com correção de paralaxe) ────
-                    res_robo = {
-                        "frontal":          None,
-                        "traseiro":         None,
-                        "orientacao_graus": robo_px.get("orientacao_graus"),
-                    }
-                    if robo_px.get("frontal"):
-                        xm, ym = _px_para_metros(
-                            robo_px["frontal"]["cx"], robo_px["frontal"]["cy"],
-                            H, ppm, x_min, y_min, K, D,
-                            altura_objeto_m=altura_aruco_m,
-                            altura_camara_m=altura_camara_m,
-                            H_metros=H_metros,
-                        )
-                        res_robo["frontal"] = {"x": xm, "y": ym}
-                    if robo_px.get("traseiro"):
-                        xm, ym = _px_para_metros(
-                            robo_px["traseiro"]["cx"], robo_px["traseiro"]["cy"],
-                            H, ppm, x_min, y_min, K, D,
-                            altura_objeto_m=altura_aruco_m,
-                            altura_camara_m=altura_camara_m,
-                            H_metros=H_metros,
-                        )
-                        res_robo["traseiro"] = {"x": xm, "y": ym}
-
-                    robo_log = "—"
-                    if res_robo["frontal"] or res_robo["traseiro"]:
-                        partes = []
-                        if res_robo["frontal"]:
-                            f = res_robo["frontal"]
-                            partes.append(f"F({f['x']:.2f},{f['y']:.2f})")
-                        if res_robo["traseiro"]:
-                            t = res_robo["traseiro"]
-                            partes.append(f"T({t['x']:.2f},{t['y']:.2f})")
-                        if res_robo["orientacao_graus"] is not None:
-                            partes.append(f"{res_robo['orientacao_graus']:.1f}°")
-                        robo_log = " ".join(partes)
-
-                    latencia = round(
-                        (time.time() - pacote["timestamp_visao"]) * 1000, 2)
-                    saida = {
-                        "indice":      indice,
-                        "tipo":        pacote.get("tipo", "vision"),
-                        "latencia_ms": latencia,
-                        "n_bolas":     len(res_bolas),
-                        "trajetoria":  res_bolas,
-                        "robo":        res_robo,
-                    }
-
-                    saida_serializavel = numpy_para_python(saida)
-
-                    # ── Empurrar para fila do GraphProcessor ───────────────
-                    try:
-                        _fila_grafo.put_nowait(saida_serializavel)
-                    except queue.Full:
-                        try:
-                            _fila_grafo.get_nowait()
-                            _fila_grafo.put_nowait(saida_serializavel)
-                            log("AVISO", "Fila do grafo cheia — descartado pacote mais antigo.")
-                        except Exception:
-                            pass
-
-                    # ── LIBERADO imediatamente — não espera pelas escritas ──
-                    # As escritas de disco são assíncronas (worker thread).
-                    # Isto elimina o bottleneck de ~1 FPS causado pelas 3
-                    # escritas síncronas de ficheiros por frame.
-                    conn.send("LIBERADO")
-
-                    if guardar_disco:
-                        fich_json = PASTA_POSICOES / f"posicao_{indice:04d}.json"
-                        _tentar_enfileirar_escrita({
-                            "tipo":    "json",
-                            "caminho": str(fich_json),
-                            "dados":   saida_serializavel,
-                        })
-
-                    agora_img = time.time()
-                    deve_guardar_imagem = (
-                        guardar_imagens
-                        and frame is not None
-                        and hasattr(frame, "shape")
-                        and agora_img >= proxima_imagem_debug
-                    )
-                    if deve_guardar_imagem:
-                        proxima_imagem_debug = agora_img + intervalo_guardar_imagens_s
-                        fich_img = PASTA_IMAGENS / f"frame_{indice:04d}.jpg"
-                        _tentar_enfileirar_escrita({
-                            "tipo":      "jpeg",
-                            "caminho":   str(fich_img),
-                            "frame":     frame,
-                            "qualidade": 90,
-                        })
-
-                        fich_img_td = PASTA_IMAGENS_TD / f"frame_{indice:04d}.jpg"
-                        _tentar_enfileirar_escrita({
-                            "tipo":      "topdown",
-                            "caminho":   str(fich_img_td),
-                            "frame":     frame,
-                            "H":         H,
-                            "out_w":     out_w_px,
-                            "out_h":     out_h_px,
-                            "K":         K,
-                            "D":         D,
-                            "qualidade": 90,
-                        })
-
-                    total_frames += 1
-                    total_bolas  += len(res_bolas)
-                    log("DEBUG",
-                        f"Frame {indice:04d} | {len(res_bolas)} bola(s) | "
-                        f"robô={robo_log} | latência={latencia}ms | total={total_frames} frames")
-                    if total_frames % 50 == 0:
-                        log("HUMANO",
-                            f"{total_frames} frames processados "
-                            f"({total_bolas} bolas no total).")
-
+                    pacote = conn.recv()
+                    _processar_pacote_producao(conn, pacote)
+                except (EOFError, ConnectionResetError, BrokenPipeError):
+                    break
                 except Exception as e:
                     log("ERRO", f"Erro ao processar pacote: {e}")
                     try:
                         conn.send("LIBERADO")
                     except Exception:
-                        pass
+                        break
 
+    address = ("localhost", PORTA)
+    with Listener(address, authkey=AUTHKEY) as listener:
+        while True:
+            conn = listener.accept()
+            threading.Thread(
+                target=_servir_conexao_producao,
+                args=(conn,),
+                daemon=True,
+                name="retificador-cliente",
+            ).start()
 
 # ─────────────────────────────────────────────
 #  PONTO DE ENTRADA

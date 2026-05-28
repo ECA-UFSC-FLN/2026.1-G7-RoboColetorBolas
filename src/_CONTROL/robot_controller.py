@@ -1,89 +1,65 @@
-﻿"""
-RobotController.py — Controlador do Robô (Pi 5) UFSC/FEUP
-==========================================================
-Liga-se ao broadcaster do GraphProcessor (porta 6021) e recebe em loop
-o estado actual: posição/orientação do robô (via ArUco) e o ponto-alvo
-de destino. Calcula comandos de velocidade (v_linear, omega) usando uma
-estratégia em duas zonas:
+"""
+RobotController.py - Supervisor do Robo (UFSC/FEUP)
+===================================================
+Liga-se ao broadcaster do GraphProcessor (porta 6021), recebe a pose do
+robo por ArUco e o proximo alvo da trajetoria, e conversa por UDP com o
+ESP32. O controlo fino deixa de ser calculado aqui: o ESP32 usa os
+encoders e a IMU para orientar e deslocar o robo localmente.
 
-    erro_angular > THR_ANG_GROSSO  →  só roda no sítio (v=0, omega=K_ang*erro)
-    erro_angular ≤ THR_ANG_GROSSO  →  movimento misto:
-                                       v     = V_MAX * cos(erro_ang) * sat(distância)
-                                       omega = K_ang * erro_ang
+Protocolo servidor -> ESP32 (JSON UDP):
+  orient_goal       pose atual, alvo, heading desejado
+  move_permission   autorizacao para seguir ate ao alvo
+  orientation_correction / stop_correct / arrived_ok / arrived_bad / stop
 
-Envia os comandos por UDP ao ESP32 do robô. Se o IP for um placeholder
-inválido, entra em MODO SIMULADO: calcula os comandos e regista-os no
-log periodicamente, mas não envia nada pela rede. Isto permite testar
-todo o pipeline sem o robô físico estar presente.
+Protocolo ESP32 -> servidor (JSON UDP):
+  {"event":"orientation_done", "segment_id":"..."}
+  {"event":"arrived",          "segment_id":"..."}
 
-Convenções:
-- omega > 0  →  o robô vira no sentido em que o produto vetorial
-                (v_robô × v_alvo) é positivo. O firmware do ESP32
-                define como mapear isso aos motores esquerda/direita.
-- v_linear   →  m/s positivo = andar para a frente.
-
-Portas:
-  6014  health-check
-  6021  cliente do GraphProcessor (recebe estado)
-  UDP   PORTA_ROBO_UDP → ESP32
+O servidor confirma cada evento com a visao. Se a orientacao falhar, envia
+correcao ate MAX_TENTATIVAS_ORIENTACAO. Durante o movimento, leituras
+consecutivas fora da tolerancia fazem o servidor mandar parar e corrigir.
 """
 
-import os
-import sys
+import argparse
 import json
 import math
-import time
+import os
 import socket
-import argparse
+import sys
 import threading
-from datetime import datetime
+import time
+from multiprocessing.connection import Client
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
-from multiprocessing.connection import Client
 
-# ─────────────────────────────────────────────
-#  CONFIGURAÇÃO — REDE LOCAL
-# ─────────────────────────────────────────────
-PORTA_HEALTH         = 6014
-PORTA_BROADCAST      = 6021
-AUTHKEY_BROADCAST    = b"controlador_ufsc"
-
-# ─────────────────────────────────────────────
-#  PARÂMETROS DO ROBÔ E DO CONTROLADOR
-# ─────────────────────────────────────────────
-# Os valores reais são lidos de resultados/configuracao/parametros.json no
-# arranque (em main()). As constantes abaixo são DEFAULTS de fallback,
-# usados apenas se o ficheiro não for carregável por alguma razão.
 import _CONFIG.system_parameters as _params
-_CFG: dict = {}                  # preenchido em main()
-
-# Defaults de fallback
-IP_ROBO              = "IP_DO_ROBO"
-PORTA_ROBO_UDP       = 5005
-V_MAX                = 0.15
-OMEGA_MAX            = 1.0
-K_ANG                = 1.5
-THR_ANG_GROSSO_GRAUS = 20.0
-D_LIM                = 0.5
-DIST_PARAGEM         = 0.05      # fixo — não configurável (segurança)
-
-# ─────────────────────────────────────────────
-#  LOGGING
-# ─────────────────────────────────────────────
 from _COMMON.logging_utils import log as _log
+
+PORTA_HEALTH = 6014
+PORTA_BROADCAST = 6021
+AUTHKEY_BROADCAST = b"controlador_ufsc"
+
+IP_ROBO = "IP_DO_ROBO"
+PORTA_ROBO_UDP = 5005
+PORTA_FEEDBACK_UDP = 5006
+
+TOLERANCIA_DISTANCIA_M = 0.20
+TOLERANCIA_ANGULO_GRAUS = 15.0
+MAX_TENTATIVAS_ORIENTACAO = 5
+LEITURAS_DESVIO_CONSECUTIVAS = 3
+DESVIO_MOVIMENTO_ANGULO_GRAUS = 25.0
+DESVIO_MOVIMENTO_DISTANCIA_M = 0.25
+REENVIAR_META_S = 0.75
 
 MOD = "CONTROLADOR"
 
+
 def log(nivel: str, msg: str):
-    """Atalho local: encapsula bolas_log.log com o módulo fixo."""
     _log(MOD, nivel, msg)
 
 
-# ─────────────────────────────────────────────
-#  HEALTH-CHECK SERVER
-# ─────────────────────────────────────────────
 def iniciar_health_server(porta: int = PORTA_HEALTH):
     def _serve():
         srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -106,9 +82,6 @@ def iniciar_health_server(porta: int = PORTA_HEALTH):
     log("DEBUG", f"Health-check ativo na porta {porta}")
 
 
-# ─────────────────────────────────────────────
-#  DETECÇÃO DE MODO SIMULADO
-# ─────────────────────────────────────────────
 def _ip_valido(ip: str) -> bool:
     try:
         socket.inet_aton(ip)
@@ -117,204 +90,320 @@ def _ip_valido(ip: str) -> bool:
         return False
 
 
-# ─────────────────────────────────────────────
-#  CÁLCULO DOS COMANDOS DE VELOCIDADE
-# ─────────────────────────────────────────────
-def _saturar(x: float, lim: float) -> float:
-    return max(-lim, min(lim, x))
+def _sinal_angulo_graus(a: float) -> float:
+    return (a + 180.0) % 360.0 - 180.0
 
 
-def calcular_comandos(robo: dict | None,
-                      alvo: dict | None) -> tuple[float, float, dict]:
-    """
-    Devolve (v_linear, omega, info_debug).
+def _pose_robo(robo: dict | None) -> dict | None:
+    if not robo or not robo.get("frontal") or not robo.get("traseiro"):
+        return None
+    f = robo["frontal"]
+    t = robo["traseiro"]
+    cx = (float(f["x"]) + float(t["x"])) / 2.0
+    cy = (float(f["y"]) + float(t["y"])) / 2.0
+    heading = math.degrees(math.atan2(float(f["y"]) - float(t["y"]),
+                                      float(f["x"]) - float(t["x"])))
+    return {
+        "x": cx,
+        "y": cy,
+        "heading_deg": _sinal_angulo_graus(heading),
+        "frontal": {"x": float(f["x"]), "y": float(f["y"])},
+        "traseiro": {"x": float(t["x"]), "y": float(t["y"])},
+    }
 
-    Estratégia: quando o erro angular é grande, o robô apenas roda no sítio
-    para se alinhar; quando é pequeno, anda em frente com velocidade
-    modulada pelo cosseno do erro angular e pela distância ao alvo.
 
-    info_debug contém grandezas internas para logging:
-      {distancia, erro_ang_graus, modo}
-    """
-    info = {"distancia": None, "erro_ang_graus": None, "modo": "parado"}
-
-    # Sem robô detectado ou sem alvo → parar
-    if not robo or not robo.get("frontal") or not robo.get("traseiro") or not alvo:
-        return 0.0, 0.0, info
-
-    fx, fy = robo["frontal"]["x"], robo["frontal"]["y"]
-    tx, ty = robo["traseiro"]["x"], robo["traseiro"]["y"]
-
-    # Centro do robô
-    cx, cy = (fx + tx) / 2.0, (fy + ty) / 2.0
-
-    # Vetor para o alvo (centro → destino)
-    dx, dy = alvo["x"] - cx, alvo["y"] - cy
+def _metricas_pose(robo: dict | None, alvo: dict | None) -> dict | None:
+    pose = _pose_robo(robo)
+    if pose is None or alvo is None:
+        return None
+    tx = float(alvo["x"])
+    ty = float(alvo["y"])
+    dx = tx - pose["x"]
+    dy = ty - pose["y"]
     distancia = math.hypot(dx, dy)
-    info["distancia"] = distancia
-
-    if distancia < DIST_PARAGEM:
-        info["modo"] = "no_alvo"
-        return 0.0, 0.0, info
-
-    # Vetor de orientação do robô (traseiro → frontal)
-    rx, ry = fx - tx, fy - ty
-
-    norma_r = math.hypot(rx, ry)
-    if norma_r < 1e-6:
-        # ArUco colapsado — improvável mas possível
-        info["modo"] = "robo_invalido"
-        return 0.0, 0.0, info
-
-    # Erro angular SIGNED via atan2(cross, dot) — robusto a wrap-around
-    cross = rx * dy - ry * dx
-    dot   = rx * dx + ry * dy
-    erro_ang_rad = math.atan2(cross, dot)   # ∈ [-π, π]
-    erro_ang_graus = math.degrees(erro_ang_rad)
-    info["erro_ang_graus"] = erro_ang_graus
-
-    # Componente angular: proporcional ao erro, saturada
-    omega = _saturar(K_ANG * erro_ang_rad, OMEGA_MAX)
-
-    # Componente linear: depende da magnitude do erro angular
-    thr_rad = math.radians(THR_ANG_GROSSO_GRAUS)
-    if abs(erro_ang_rad) > thr_rad:
-        # Erro grande → só roda
-        v_linear = 0.0
-        info["modo"] = "rotacao_pura"
-    else:
-        # Erro pequeno → anda em frente, modulado por cos(erro) e distância
-        sat_dist = min(1.0, distancia / D_LIM)
-        v_linear = V_MAX * math.cos(erro_ang_rad) * sat_dist
-        info["modo"] = "movimento_misto"
-
-    return v_linear, omega, info
+    desejado = math.degrees(math.atan2(dy, dx))
+    erro = _sinal_angulo_graus(desejado - pose["heading_deg"])
+    return {
+        "pose": pose,
+        "target": {"x": tx, "y": ty},
+        "distance_m": distancia,
+        "desired_heading_deg": _sinal_angulo_graus(desejado),
+        "heading_error_deg": erro,
+        "aligned": abs(erro) <= TOLERANCIA_ANGULO_GRAUS,
+        "at_target": distancia <= TOLERANCIA_DISTANCIA_M,
+    }
 
 
-# ─────────────────────────────────────────────
-#  ENVIO UDP AO ESP32
-# ─────────────────────────────────────────────
-def enviar_udp(sock: socket.socket, ip: str, porta: int,
-               v: float, w: float, seq: int) -> bool:
-    """
-    Envia um pacote JSON ao ESP32. UDP fire-and-forget, sem ACK.
-    Devolve False só em erros locais (socket fechado, etc).
-    """
-    pacote = json.dumps({
-        "v":   round(v, 4),
-        "w":   round(w, 4),
+def _segment_id(estado: dict) -> str | None:
+    alvo = estado.get("alvo_destino")
+    if not alvo:
+        return None
+    modo = estado.get("modo_operacao", "?")
+    fase = estado.get("fase") or "sem_fase"
+    faixa = estado.get("faixa_label") or "-"
+    wp = estado.get("waypoint_idx", "-")
+    x = round(float(alvo["x"]), 3)
+    y = round(float(alvo["y"]), 3)
+    return f"{modo}:{fase}:{faixa}:{wp}:{x}:{y}"
+
+
+def _pacote_base(tipo: str, segment_id: str | None, estado: dict, metricas: dict | None,
+                 seq: int) -> dict:
+    pacote = {
+        "type": tipo,
         "seq": seq,
-        "ts":  round(time.time(), 3),
-    }).encode("utf-8")
-    try:
-        sock.sendto(pacote, (ip, porta))
+        "segment_id": segment_id,
+        "ts": round(time.time(), 3),
+        "vision_index": estado.get("indice_visao"),
+        "mode": estado.get("modo_operacao"),
+        "phase": estado.get("fase"),
+        "rectifier_latency_ms": estado.get("latencia_retificador_ms"),
+    }
+    if metricas is not None:
+        pacote.update({
+            "robot_pose": metricas["pose"],
+            "target": metricas["target"],
+            "distance_m": round(metricas["distance_m"], 4),
+            "desired_heading_deg": round(metricas["desired_heading_deg"], 2),
+            "heading_error_deg": round(metricas["heading_error_deg"], 2),
+            "tolerance_distance_m": TOLERANCIA_DISTANCIA_M,
+            "tolerance_heading_deg": TOLERANCIA_ANGULO_GRAUS,
+        })
+    return pacote
+
+
+def _enviar(sock: socket.socket, ip: str, porta: int, pacote: dict,
+            modo_simulado: bool) -> bool:
+    if modo_simulado:
         return True
-    except Exception:
+    try:
+        sock.sendto(json.dumps(pacote, ensure_ascii=False).encode("utf-8"), (ip, porta))
+        return True
+    except Exception as e:
+        log("AVISO", f"Falha UDP para ESP32: {e}")
         return False
 
 
-# ─────────────────────────────────────────────
-#  LOOP PRINCIPAL
-# ─────────────────────────────────────────────
-def main():
-    global IP_ROBO, PORTA_ROBO_UDP, V_MAX, OMEGA_MAX, K_ANG
-    global THR_ANG_GROSSO_GRAUS, D_LIM, _CFG
+def _receber_eventos(sock: socket.socket) -> list[dict]:
+    eventos = []
+    while True:
+        try:
+            data, addr = sock.recvfrom(4096)
+        except BlockingIOError:
+            break
+        except Exception as e:
+            log("AVISO", f"Falha ao receber feedback UDP: {e}")
+            break
+        try:
+            evento = json.loads(data.decode("utf-8"))
+            evento["_addr"] = addr[0]
+            eventos.append(evento)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            log("AVISO", f"Feedback UDP inválido de {addr[0]}")
+    return eventos
 
-    parser = argparse.ArgumentParser(description="Controlador do Robô — UFSC/FEUP")
-    parser.add_argument("--ip", default=None,
-                        help="IP do ESP32 (sobrepõe parametros.json)")
+
+def _log_metricas(prefixo: str, metricas: dict | None, estado: dict):
+    if metricas is None:
+        log("DEBUG", f"{prefixo}: sem pose ArUco completa.")
+        return
+    lat_ret = estado.get("latencia_retificador_ms")
+    lat_graph = (time.time() - float(estado.get("timestamp", time.time()))) * 1000.0
+    lat_txt = f"ret={lat_ret}ms graph->ctrl={lat_graph:.0f}ms"
+    log("DEBUG",
+        f"{prefixo}: d={metricas['distance_m']*100:.1f}cm "
+        f"erro={metricas['heading_error_deg']:+.1f}° {lat_txt}")
+
+
+def main():
+    global IP_ROBO, PORTA_ROBO_UDP, PORTA_FEEDBACK_UDP
+    global TOLERANCIA_DISTANCIA_M, TOLERANCIA_ANGULO_GRAUS
+    global MAX_TENTATIVAS_ORIENTACAO, LEITURAS_DESVIO_CONSECUTIVAS
+    global DESVIO_MOVIMENTO_ANGULO_GRAUS, DESVIO_MOVIMENTO_DISTANCIA_M
+
+    parser = argparse.ArgumentParser(description="Supervisor UDP do Robo - UFSC/FEUP")
+    parser.add_argument("--ip", default=None, help="IP do ESP32")
     parser.add_argument("--porta-udp", type=int, default=None,
-                        help="Porta UDP do ESP32 (sobrepõe parametros.json)")
-    parser.add_argument("--log-cada", type=int, default=5,
-                        help="Imprime comandos a cada N pacotes (default 5)")
+                        help="Porta UDP onde o ESP32 recebe comandos")
+    parser.add_argument("--porta-feedback", type=int, default=None,
+                        help="Porta UDP local para eventos do ESP32")
+    parser.add_argument("--max-orient", type=int, default=MAX_TENTATIVAS_ORIENTACAO,
+                        help="Máximo de tentativas de correção de orientação")
+    parser.add_argument("--leituras-desvio", type=int,
+                        default=LEITURAS_DESVIO_CONSECUTIVAS,
+                        help="Leituras consecutivas fora da tolerância antes de parar")
     args = parser.parse_args()
 
-    # ── Carregar parâmetros configurados pelo utilizador ──
-    _CFG = _params.carregar()
-    IP_ROBO              = args.ip       or _CFG.get("ip_robo", IP_ROBO)
-    PORTA_ROBO_UDP       = args.porta_udp or int(_CFG.get("porta_udp", PORTA_ROBO_UDP))
-    V_MAX                = float(_CFG.get("v_max", V_MAX))
-    OMEGA_MAX            = float(_CFG.get("omega_max", OMEGA_MAX))
-    K_ANG                = float(_CFG.get("k_ang", K_ANG))
-    THR_ANG_GROSSO_GRAUS = float(_CFG.get("thr_ang_grosso_graus", THR_ANG_GROSSO_GRAUS))
-    D_LIM                = float(_CFG.get("d_lim", D_LIM))
-
-    porta_udp = PORTA_ROBO_UDP
+    cfg = _params.carregar()
+    IP_ROBO = args.ip or cfg.get("ip_robo", IP_ROBO)
+    PORTA_ROBO_UDP = args.porta_udp or int(cfg.get("porta_udp", PORTA_ROBO_UDP))
+    PORTA_FEEDBACK_UDP = args.porta_feedback or int(
+        cfg.get("porta_udp_feedback", PORTA_ROBO_UDP + 1)
+    )
+    TOLERANCIA_DISTANCIA_M = float(
+        cfg.get("tolerancia_distancia_cm", TOLERANCIA_DISTANCIA_M * 100)
+    ) / 100.0
+    TOLERANCIA_ANGULO_GRAUS = float(
+        cfg.get("tolerancia_angulo_graus", TOLERANCIA_ANGULO_GRAUS)
+    )
+    MAX_TENTATIVAS_ORIENTACAO = max(1, int(args.max_orient))
+    LEITURAS_DESVIO_CONSECUTIVAS = max(1, int(args.leituras_desvio))
+    DESVIO_MOVIMENTO_ANGULO_GRAUS = max(
+        TOLERANCIA_ANGULO_GRAUS,
+        float(cfg.get("supervisor_desvio_angulo_graus", DESVIO_MOVIMENTO_ANGULO_GRAUS)),
+    )
+    DESVIO_MOVIMENTO_DISTANCIA_M = float(
+        cfg.get("supervisor_desvio_distancia_cm", DESVIO_MOVIMENTO_DISTANCIA_M * 100)
+    ) / 100.0
 
     iniciar_health_server()
-
-    log("DEBUG", f"parâmetros carregados de {_params.FICH_PARAMS}")
-    log("DEBUG", f"V_MAX={V_MAX} OMEGA_MAX={OMEGA_MAX} K_ANG={K_ANG} "
-                 f"THR_ANG_GROSSO={THR_ANG_GROSSO_GRAUS}° D_LIM={D_LIM}m")
-
     modo_simulado = not _ip_valido(IP_ROBO)
     if modo_simulado:
-        log("AVISO", f"IP do robô '{IP_ROBO}' não é válido — MODO SIMULADO ativo.")
-        log("HUMANO", "Comandos serão calculados e registados, mas não enviados.")
+        log("AVISO", f"IP do robô '{IP_ROBO}' não é válido - MODO SIMULADO ativo.")
     else:
-        log("HUMANO",  f"IP do robô: {IP_ROBO}:{porta_udp}")
-        log("HUMANO", "Modo: envio UDP ativo.")
+        log("HUMANO", f"ESP32 comandos: {IP_ROBO}:{PORTA_ROBO_UDP}")
+    log("HUMANO", f"ESP32 feedback: UDP local :{PORTA_FEEDBACK_UDP}")
+    log("DEBUG",
+        f"tolerâncias: alvo={TOLERANCIA_DISTANCIA_M*100:.0f}cm "
+        f"orientação={TOLERANCIA_ANGULO_GRAUS:.0f}° "
+        f"desvio_mov={DESVIO_MOVIMENTO_ANGULO_GRAUS:.0f}°/"
+        f"{DESVIO_MOVIMENTO_DISTANCIA_M*100:.0f}cm")
 
-    sock_udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock_tx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock_rx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock_rx.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock_rx.bind(("", PORTA_FEEDBACK_UDP))
+    sock_rx.setblocking(False)
+
     seq = 0
+    current_segment = None
+    phase = "idle"
+    orient_attempts = 0
+    bad_readings = 0
+    last_distance = None
+    last_send = 0.0
+    stopped_sent = False
+    rx_janela = 0
+    udp_janela = 0
+    event_janela = 0
+    t_taxa = time.time()
     backoff = 0.5
-    n_pacotes = 0
-    n_no_robo = 0
 
-    log("HUMANO", f"A ligar ao broadcaster do GraphProcessor...")
-    log("DEBUG",  f"localhost:{PORTA_BROADCAST}")
+    def send(tipo: str, segment_id: str | None, estado: dict, metricas: dict | None):
+        nonlocal seq, udp_janela, last_send
+        seq += 1
+        pacote = _pacote_base(tipo, segment_id, estado, metricas, seq)
+        ok = _enviar(sock_tx, IP_ROBO, PORTA_ROBO_UDP, pacote, modo_simulado)
+        if ok:
+            udp_janela += 1
+            last_send = time.time()
+        return ok
 
+    log("HUMANO", "A ligar ao broadcaster do GraphProcessor...")
     while True:
         try:
             with Client(("localhost", PORTA_BROADCAST), authkey=AUTHKEY_BROADCAST) as conn:
-                log("HUMANO", "Ligado ao broadcaster do GraphProcessor.")
+                log("HUMANO", "Ligado ao broadcaster. Supervisão ativa.")
                 backoff = 0.5
 
                 while True:
                     estado = conn.recv()
-                    n_pacotes += 1
+                    rx_janela += 1
+                    eventos = _receber_eventos(sock_rx)
+                    event_janela += len(eventos)
 
-                    robo = estado.get("robo")
                     alvo = estado.get("alvo_destino")
-                    fase = estado.get("fase")
-                    faixa_label = estado.get("faixa_label")
+                    robo = estado.get("robo")
+                    segment_id = _segment_id(estado)
+                    metricas = _metricas_pose(robo, alvo)
 
-                    v, w, info = calcular_comandos(robo, alvo)
-                    seq += 1
+                    if segment_id is None:
+                        current_segment = None
+                        phase = "idle"
+                        orient_attempts = 0
+                        bad_readings = 0
+                        last_distance = None
+                        if not stopped_sent:
+                            send("stop", None, estado, metricas)
+                            stopped_sent = True
+                    else:
+                        stopped_sent = False
 
-                    if not robo or not robo.get("frontal") or not robo.get("traseiro"):
-                        n_no_robo += 1
+                    if segment_id is not None and segment_id != current_segment:
+                        current_segment = segment_id
+                        phase = "orienting"
+                        orient_attempts = 0
+                        bad_readings = 0
+                        last_distance = None
+                        send("orient_goal", current_segment, estado, metricas)
+                        _log_metricas("nova meta de orientação", metricas, estado)
 
-                    if not modo_simulado:
-                        ok = enviar_udp(sock_udp, IP_ROBO, porta_udp, v, w, seq)
-                        if not ok and n_pacotes % 50 == 1:
-                            log("AVISO", "Falha a enviar UDP (sem rota?).")
+                    for evento in eventos:
+                        if segment_id is None:
+                            continue
+                        if evento.get("segment_id") not in (None, current_segment):
+                            continue
+                        nome = str(evento.get("event", "")).lower()
+                        if nome == "orientation_done" and phase == "orienting":
+                            if metricas and metricas["aligned"]:
+                                phase = "moving"
+                                bad_readings = 0
+                                last_distance = metricas["distance_m"]
+                                send("move_permission", current_segment, estado, metricas)
+                                _log_metricas("orientação validada", metricas, estado)
+                            else:
+                                orient_attempts += 1
+                                tipo = "orientation_correction"
+                                if orient_attempts >= MAX_TENTATIVAS_ORIENTACAO:
+                                    tipo = "stop"
+                                    phase = "blocked"
+                                send(tipo, current_segment, estado, metricas)
+                                _log_metricas(
+                                    f"orientação fora ({orient_attempts}/{MAX_TENTATIVAS_ORIENTACAO})",
+                                    metricas,
+                                    estado,
+                                )
+                        elif nome == "arrived":
+                            if metricas and metricas["at_target"]:
+                                send("arrived_ok", current_segment, estado, metricas)
+                                _log_metricas("chegada validada", metricas, estado)
+                                phase = "waiting_next"
+                            else:
+                                send("arrived_bad", current_segment, estado, metricas)
+                                _log_metricas("chegada rejeitada", metricas, estado)
 
-                    if n_pacotes % max(1, args.log_cada) == 0:
+                    now = time.time()
+                    if segment_id is not None and phase == "orienting" and now - last_send >= REENVIAR_META_S:
+                        send("orient_goal", current_segment, estado, metricas)
+
+                    if phase == "moving" and metricas is not None:
+                        piorou = (
+                            abs(metricas["heading_error_deg"]) > DESVIO_MOVIMENTO_ANGULO_GRAUS
+                            or (
+                                last_distance is not None
+                                and metricas["distance_m"] > last_distance + DESVIO_MOVIMENTO_DISTANCIA_M
+                            )
+                        )
+                        bad_readings = bad_readings + 1 if piorou else 0
+                        last_distance = metricas["distance_m"]
+                        if bad_readings >= LEITURAS_DESVIO_CONSECUTIVAS:
+                            send("stop_correct", current_segment, estado, metricas)
+                            phase = "orienting"
+                            orient_attempts = 0
+                            bad_readings = 0
+                            _log_metricas("desvio persistente - parar/corrigir", metricas, estado)
+
+                    agora_taxa = time.time()
+                    if agora_taxa - t_taxa >= 1.0:
+                        dt = agora_taxa - t_taxa
                         sufixo = " [SIM]" if modo_simulado else ""
-                        modo_op = estado.get("modo_operacao", "FAIXAS")
-                        if alvo is None:
-                            log("DEBUG", f"idle{sufixo}  v={v:+.3f}  w={w:+.3f}  "
-                                         f"(sem disparo ativo)")
-                        elif modo_op == "GLOBAL":
-                            d_str   = (f"{info['distancia']*100:.1f}cm"
-                                       if info["distancia"] is not None else "?")
-                            ang_str = (f"{info['erro_ang_graus']:+.1f}°"
-                                       if info["erro_ang_graus"] is not None else "?")
-                            wp_idx  = estado.get("waypoint_idx", "?")
-                            wp_tot  = estado.get("waypoints_total", "?")
-                            log("DEBUG",
-                                f"GLOBAL{sufixo} [{wp_idx}/{wp_tot}]  "
-                                f"v={v:+.3f}m/s  w={w:+.3f}rad/s  "
-                                f"d={d_str}  ang={ang_str}  modo={info['modo']}")
-                        else:
-                            d_str   = (f"{info['distancia']*100:.1f}cm"
-                                       if info["distancia"] is not None else "?")
-                            ang_str = (f"{info['erro_ang_graus']:+.1f}°"
-                                       if info["erro_ang_graus"] is not None else "?")
-                            log("DEBUG", f"{fase or '?'} → faixa {faixa_label or '?'}{sufixo}  "
-                                         f"v={v:+.3f}m/s  w={w:+.3f}rad/s  "
-                                         f"d={d_str}  ang={ang_str}  modo={info['modo']}")
+                        log("DEBUG",
+                            f"taxa controlo: rx={rx_janela/dt:.1f}Hz "
+                            f"udp={udp_janela/dt:.1f}Hz "
+                            f"fb={event_janela/dt:.1f}Hz{sufixo} "
+                            f"fase={phase} indice_visao={estado.get('indice_visao')}")
+                        rx_janela = udp_janela = event_janela = 0
+                        t_taxa = agora_taxa
 
         except (ConnectionRefusedError, OSError):
             log("AVISO", f"GraphProcessor não disponível. A retentar em {backoff:.1f}s...")
@@ -330,15 +419,10 @@ def main():
             log("ERRO", f"Erro inesperado: {e}")
             time.sleep(1.0)
 
-    sock_udp.close()
-    log("HUMANO", f"Controlador encerrado. Pacotes recebidos: {n_pacotes} "
-                  f"(sem deteção do robô em {n_no_robo}).")
+    sock_tx.close()
+    sock_rx.close()
+    log("HUMANO", "Supervisor encerrado.")
 
 
 if __name__ == "__main__":
     main()
-
-
-
-
-

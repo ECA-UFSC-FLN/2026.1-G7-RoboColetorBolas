@@ -40,6 +40,7 @@ import time
 import socket
 import threading
 import argparse
+from collections import deque
 from queue import Queue, Empty, Full
 from pathlib import Path
 
@@ -94,7 +95,7 @@ N_OBS_MIN_ESTAVEL = 3                # mín. de observações para bola contar
 TEMPO_MIN_ESTAVEL_S = 1.0            # confirma estabilidade independentemente do FPS
 VELOCIDADE_MAX_PARADA_M_S = 0.08     # acima disto a bola ainda está em movimento
 TEMPO_EXPIRAR_BOLA_S = 1.5           # remove rastos temporários sem novas observações
-INTERVALO_VIS     = 0.05             # refresh da janela matplotlib (s) — fixo
+INTERVALO_VIS     = 0.10             # refresh da janela matplotlib (s) — fixo
 TIMEOUT_RET       = 1.5              # timeout em cada pedido de JSON — fixo
 
 # ─────────────────────────────────────────────
@@ -341,6 +342,7 @@ class EstadoGrafo:
         self.bolas     = []                 # list[BolaConhecida]
         self.robo      = {"frontal": None, "traseiro": None, "orientacao_graus": None}
         self.ultimo_indice_processado = -1
+        self.ultima_latencia_retificador_ms = None
         self.disparo_ativo = None           # FaixaQuadra atualmente em execução
         self.fase_varrimento = None         # None | "aguarda_inicio" | "em_varrimento"
         self.t_disparo_iniciado = 0.0       # timestamp do início do disparo (timeout)
@@ -1031,6 +1033,8 @@ def broadcast_estado(estado: "EstadoGrafo"):
         "fase":          fase_bc,
         "faixa_label":   faixa_label,
         "alvo_destino":  alvo_destino,
+        "indice_visao":  estado.ultimo_indice_processado,
+        "latencia_retificador_ms": estado.ultima_latencia_retificador_ms,
         **extra,
     }
 
@@ -1052,6 +1056,34 @@ def broadcast_estado(estado: "EstadoGrafo"):
 # ─────────────────────────────────────────────
 #  CLIENTE DO RETIFICADOR (puxa JSONs)
 # ─────────────────────────────────────────────
+def _enfileirar_pacote_recente(fila_jsons: Queue, pacote: dict):
+    if pacote.get("tipo") == "aruco":
+        with fila_jsons.mutex:
+            antigos = len(fila_jsons.queue)
+            fila_jsons.queue = deque(
+                p for p in fila_jsons.queue
+                if not (isinstance(p, dict) and p.get("tipo") == "aruco")
+            )
+            removidos = antigos - len(fila_jsons.queue)
+            fila_jsons.unfinished_tasks = max(
+                0, fila_jsons.unfinished_tasks - removidos
+            )
+            fila_jsons.not_full.notify_all()
+
+    try:
+        fila_jsons.put_nowait(pacote)
+    except Full:
+        try:
+            fila_jsons.get_nowait()
+            fila_jsons.task_done()
+        except Empty:
+            pass
+        try:
+            fila_jsons.put_nowait(pacote)
+        except Full:
+            pass
+
+
 def loop_cliente_retificador(estado: EstadoGrafo, fila_jsons: Queue, parar: threading.Event):
     """
     Loop persistente: liga ao retificador (porta 6020) e pede o próximo
@@ -1073,17 +1105,7 @@ def loop_cliente_retificador(estado: EstadoGrafo, fila_jsons: Queue, parar: thre
                         if conn.poll(timeout=TIMEOUT_RET):
                             pacote = conn.recv()
                             if pacote and isinstance(pacote, dict):
-                                try:
-                                    fila_jsons.put_nowait(pacote)
-                                except Full:
-                                    try:
-                                        fila_jsons.get_nowait()
-                                    except Empty:
-                                        pass
-                                    try:
-                                        fila_jsons.put_nowait(pacote)
-                                    except Full:
-                                        pass
+                                _enfileirar_pacote_recente(fila_jsons, pacote)
                         else:
                             # nada novo; pequena pausa e tenta de novo
                             time.sleep(0.1)
@@ -1338,6 +1360,7 @@ def processar_pacote(estado: EstadoGrafo, pacote: dict):
                 "orientacao_graus": robo.get("orientacao_graus"),
             }
         estado.ultimo_indice_processado = indice
+        estado.ultima_latencia_retificador_ms = pacote.get("latencia_ms")
 
     if MODO_OPERACAO == "GLOBAL":
         with estado.lock:
@@ -1433,7 +1456,7 @@ def main():
 
     # Threads
     parar = threading.Event()
-    fila_jsons: Queue = Queue(maxsize=20)
+    fila_jsons: Queue = Queue(maxsize=8)
 
     t_cli = threading.Thread(
         target=loop_cliente_retificador,
