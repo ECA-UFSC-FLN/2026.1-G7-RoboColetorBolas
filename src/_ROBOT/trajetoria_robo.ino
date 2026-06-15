@@ -51,9 +51,13 @@ const int MOTOR_L_SIGN = 1;
 const int MOTOR_R_SIGN = 1;
 
 // PWM. PWM_CRUISE baixo costuma dar menos derrapagem e menos sobrecurso.
-const int PWM_MIN = 100;
-const int PWM_CRUISE = 108;
-const int PWM_MAX = 145;
+
+const int PWM_MIN_L = 83; // Coloque o valor achado
+const int PWM_MIN_R = 107; // Coloque o valor achado
+const float FATOR_DIREITO = 1.0321; // Coloque o fator achado
+const int PWM_MIN = 120;
+const int PWM_CRUISE = 160;
+const int PWM_MAX = 255;
 const float SLOWDOWN_CM = 18.0;
 
 // PID para virar no sitio.
@@ -363,8 +367,9 @@ void driveStraight(float cm) {
     float corrHead = pidHeading.step(errHead, dt, 35.0);
     int corr = (int)(corrTicks - corrHead);
 
-    int pwmL = constrain(base - corr, PWM_MIN, PWM_MAX);
-    int pwmR = constrain(base + corr, PWM_MIN, PWM_MAX);
+    // Aplica o mínimo independente e multiplica o direito pelo fator de correção
+    int pwmL = constrain(base - corr, PWM_MIN_L, PWM_MAX);
+    int pwmR = constrain((base + corr) * FATOR_DIREITO, PWM_MIN_R, PWM_MAX);
     setMotors(pwmL, pwmR);
 
     if (now - lastLog >= LOG_EVERY_MS) {
