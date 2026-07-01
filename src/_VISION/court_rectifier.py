@@ -14,6 +14,9 @@ Dois modos de operação:
 Perfis de câmara (geridos por parametros.py):
   IPHONE16_1X   — lente principal 1× (f≈5823px, 4032×3024)
   IPHONE16_05X  — ultra-grande angular 0.5× (f≈2912px, 4032×3024)
+  SAMSUNG_S25_PLUS_1X / SAMSUNG_S25_PLUS_UW — perfis aproximados Samsung
+  XIAOMI_MI_9T_1X — lente principal 1× (perfil aproximado, 8000×6000)
+  CALIBRADO      — parâmetros obtidos por calibração intrínseca real
   EXTERNO        — parâmetros configuráveis pelo utilizador (ext_fx, ext_fy, …)
 
 Correção de paralaxe (nova):

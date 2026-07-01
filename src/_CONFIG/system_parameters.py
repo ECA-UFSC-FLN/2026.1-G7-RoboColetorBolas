@@ -9,7 +9,7 @@ criado automaticamente com os defaults.
 Categorias e respetivos parâmetros (25 no total):
 
   CAMARA
-    perfil_camara             "IPHONE16_1X" | "IPHONE16_05X" | "SAMSUNG_S25_PLUS_1X" | "SAMSUNG_S25_PLUS_UW" | "EXTERNO"
+    perfil_camara             "IPHONE16_1X" | "IPHONE16_05X" | "SAMSUNG_S25_PLUS_1X" | "SAMSUNG_S25_PLUS_UW" | "XIAOMI_MI_9T_1X" | "EXTERNO"
     altura_camara_m           altura da câmara ao solo (m)
     altura_bola_m             raio da bola de ténis = 0.0325 m (para correção de paralaxe)
     altura_aruco_m            altura dos marcadores ArUco ao solo (m) (topo do robô)
@@ -127,6 +127,23 @@ PERFIS_INTRINSICOS.update({
     ),
 })
 
+# Xiaomi Mi 9T — câmara principal 1× de 48 MP (resolução máxima 8000×6000).
+# Perfil aproximado para seleção imediata; para medições rigorosas deve ser
+# substituído por uma calibração intrínseca real através do perfil CALIBRADO.
+_XIAOMI_MI_9T_1X_K = [
+    [5950.0,    0.0, 4000.0],
+    [   0.0, 5950.0, 3000.0],
+    [   0.0,    0.0,    1.0],
+]
+_XIAOMI_MI_9T_1X_D = [0.10, -0.20, 0.0001, -0.0002, 0.14]
+_XIAOMI_MI_9T_1X_RES = [8000, 6000]
+
+PERFIS_INTRINSICOS["XIAOMI_MI_9T_1X"] = (
+    _XIAOMI_MI_9T_1X_K,
+    _XIAOMI_MI_9T_1X_D,
+    _XIAOMI_MI_9T_1X_RES,
+)
+
 
 # ─────────────────────────────────────────────
 #  ESQUEMA DOS PARÂMETROS
@@ -148,7 +165,7 @@ ESQUEMA: list[dict] = [
     {
         "chave":     "perfil_camara",
         "categoria": "CAMARA",
-        "descricao": "Perfil de câmara: iPhone 16, Samsung S25 Plus, calibrado, ou câmara externa configurável",
+        "descricao": "Perfil de câmara: iPhone 16, Samsung S25 Plus, Xiaomi Mi 9T, calibrado, ou câmara externa configurável",
         "unidade":   "",
         "default":   "IPHONE16_1X",
         "tipo":      "str",
@@ -159,6 +176,7 @@ ESQUEMA: list[dict] = [
             "IPHONE16_05X",
             "SAMSUNG_S25_PLUS_1X",
             "SAMSUNG_S25_PLUS_UW",
+            "XIAOMI_MI_9T_1X",
             "CALIBRADO",
             "EXTERNO",
         ],

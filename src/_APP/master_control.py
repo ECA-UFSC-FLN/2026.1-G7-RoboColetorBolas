@@ -13,9 +13,9 @@ Argumentos de linha de comando:
             utilizador vê só mensagens humanas, eventos, avisos e erros.
 
 Câmara suportada:
-  Camo Studio (Reincubate) via USB. O iPhone deve estar ligado via USB
-  com a app Camo ativa antes de iniciar. O perfil da câmara
-  (IPHONE16_1X / IPHONE16_05X / EXTERNO) é configurado nos parâmetros
+  Camo Studio (Reincubate) via USB. O telemóvel deve estar ligado via USB
+  com a app de câmara ativa antes de iniciar. O perfil da câmara
+  (iPhone 16 / Samsung S25 Plus / Xiaomi Mi 9T / EXTERNO) é configurado nos parâmetros
   (opção 3) e determina os intrínsecos e a correção de paralaxe.
 
 Health-checks (cada módulo abre o seu numa porta dedicada):
