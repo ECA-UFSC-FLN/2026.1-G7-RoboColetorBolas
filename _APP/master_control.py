@@ -53,7 +53,9 @@ from _COMMON.logging_utils import log, pedir_input
 # ─────────────────────────────────────────────
 #  CONFIGURAÇÃO
 # ─────────────────────────────────────────────
-PYTHON_EXE = r"C:\Users\andre\venv_bolas\Scripts\python.exe"
+# Usa exatamente o interpretador que arrancou o MasterControl. Isto torna o
+# projeto portátil e garante que os subprocessos usam o mesmo ambiente virtual.
+PYTHON_EXE = os.environ.get("ROBO_PYTHON", sys.executable)
 BASE_PATH = PROJECT_ROOT
 SCRIPTS = {
     "debug_console": BASE_PATH / "_TOOLS" / "debug_console.py",

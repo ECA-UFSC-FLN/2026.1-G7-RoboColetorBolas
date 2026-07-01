@@ -4,6 +4,8 @@ Sistema de visao e controlo para detetar bolas de tenis numa quadra, estimar a p
 
 ## Arranque
 
+Para instalar o projeto num computador novo, segue [INSTALACAO.md](INSTALACAO.md).
+
 Usa os atalhos da raiz:
 
 - `ASTART.bat` arranca o sistema normal.
@@ -29,7 +31,7 @@ Pastas de dados e artefactos:
 
 - `DataSet/` dataset YOLO.
 - `runs/` saidas do treino YOLO.
-- `models/` pesos base dos modelos.
+- `models/` pesos YOLO necessários para produção e treino.
 - `assets/` marcadores ArUco e outros recursos estaticos.
 - `resultados/` calibracoes, configuracoes, trajetorias e dumps de debug.
 - `_backup_codigo_*` backup automatico feito antes da reorganizacao.
