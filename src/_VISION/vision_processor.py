@@ -50,8 +50,7 @@ import _CONFIG.system_parameters as _params
 BASE_PATH = Path(__file__).resolve().parents[1]
 MOD       = "VISAO"
 
-MODELO_PATH = (BASE_PATH / "runs" / "detect" / "treino_bolas_v24"
-               / "weights" / "best.pt")
+MODELO_PATH = BASE_PATH / "models" / "balls_best.pt"
 
 PORTA_ENTRADA       = 6000
 PORTA_HEALTH        = 6002
@@ -62,7 +61,6 @@ AUTHKEY_RET         = b"retificador_ufsc"
 AUTHKEY_BROADCAST   = b"controlador_ufsc"
 
 CONFIANCA_MIN  = 0.50
-DISPOSITIVO    = 0             # 0=GPU CUDA, "cpu" para CPU
 
 # ── ArUco ─────────────────────────────────────
 ARUCO_DICT     = cv2.aruco.DICT_4X4_50
@@ -379,14 +377,16 @@ def iniciar_visao():
 
     try:
         from ultralytics import YOLO
+        import torch
+        dispositivo = 0 if torch.cuda.is_available() else "cpu"
         t0    = time.time()
         model = YOLO(str(MODELO_PATH))
         dummy = np.zeros((640, 640, 3), dtype=np.uint8)
         model.predict(source=dummy, conf=CONFIANCA_MIN,
-                      device=DISPOSITIVO, verbose=False)
+                      device=dispositivo, verbose=False)
         t_load = time.time() - t0
         log("HUMANO", f"Modelo YOLO carregado em {t_load:.1f}s.")
-        log("DEBUG",  f"dispositivo={DISPOSITIVO}, confiança_min={CONFIANCA_MIN}")
+        log("DEBUG",  f"dispositivo={dispositivo}, confiança_min={CONFIANCA_MIN}")
     except Exception as e:
         log("ERRO", f"Falha ao carregar YOLO: {e}")
         sys.exit(1)
@@ -451,7 +451,7 @@ def iniciar_visao():
                         results = model.predict(
                             source=frame,
                             conf=CONFIANCA_MIN,
-                            device=DISPOSITIVO,
+                            device=dispositivo,
                             verbose=False,
                         )
                         ms_yolo = (time.time() - t_inf) * 1000
@@ -479,13 +479,13 @@ def iniciar_visao():
                     else:
                         stats["frames_yolo_skip"] += 1
 
-                    if skip_yolo:
-                        log("DEBUG",
-                            f"Frame {indice:04d} [DISPARO — sem YOLO]")
-                    else:
-                        log("DEBUG",
-                            f"Frame {indice:04d} | bolas={len(bolas)} "
-                            f"[{ms_yolo:.0f}ms]")
+                    if stats["frames"] % 10 == 0 or bolas:
+                        if skip_yolo:
+                            log("DEBUG", f"Frame {indice:04d} [DISPARO - sem YOLO]")
+                        else:
+                            log("DEBUG",
+                                f"Frame {indice:04d} | bolas={len(bolas)} "
+                                f"[{ms_yolo:.0f}ms]")
 
                     frame_debug = None
                     agora_debug = time.time()

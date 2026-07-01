@@ -31,7 +31,7 @@ Critério de disparo:
   peso_faixa / total_acumulado >= THRESHOLD_PCT  E  peso_faixa >= K_MIN
 
 Critério de chegada (via visão, ArUco):
-  distância(centro_robo, ponto_alvo) <= DIST_CHEGADA_M
+  distância(ArUco frontal, ponto_alvo) <= DIST_CHEGADA_M
 """
 
 import json
@@ -94,14 +94,15 @@ K_MIN             = 4
 N_OBS_MIN_ESTAVEL = 3                # mín. de observações para bola contar
 TEMPO_MIN_ESTAVEL_S = 1.0            # confirma estabilidade independentemente do FPS
 VELOCIDADE_MAX_PARADA_M_S = 0.08     # acima disto a bola ainda está em movimento
-TEMPO_EXPIRAR_BOLA_S = 1.5           # remove rastos temporários sem novas observações
+RAIO_ESTACIONARIA_BOLA_M = 0.03      # permanência espacial para confirmar bola parada
+TEMPO_EXPIRAR_BOLA_S = 1.5           # legado: bolas já não expiram antes do disparo
 INTERVALO_VIS     = 0.10             # refresh da janela matplotlib (s) — fixo
 TIMEOUT_RET       = 1.5              # timeout em cada pedido de JSON — fixo
 
 # ─────────────────────────────────────────────
 #  TOLERÂNCIAS DE CHEGADA AO PONTO  (afinar em testes!)
 # ─────────────────────────────────────────────
-# Quão perto (em metros) tem de estar o centro do robô para considerarmos
+# Quão perto (em metros) tem de estar o ArUco frontal para considerarmos
 # que "chegou" a um ponto. Avaliar em campo: depende do tamanho da quadra,
 # da precisão da homografia e da estabilidade da deteção do ArUco.
 TOLERANCIA_DISTANCIA_AO_PONTO = 0.20   # metros
@@ -115,6 +116,7 @@ TOLERANCIA_ANGULO_GRAUS       = 15.0
 # Tempo máximo de varrimento; se for excedido, liberta a faixa por
 # segurança (provável perda de ArUco ou bloqueio mecânico).
 TIMEOUT_VARRIMENTO_S          = 90.0
+RAIO_RECOLHA_BOLA_M           = 0.18
 
 # ── Modo de operação (lido de parametros.json em main()) ──────
 # "FAIXAS" — comportamento original: disparo por zona
@@ -282,7 +284,8 @@ def construir_faixas(poligono: Polygon, n: int) -> list[FaixaQuadra]:
 class BolaConhecida:
     __slots__ = (
         "x", "y", "n_obs", "primeira_visao", "ultima_visao", "faixa_id",
-        "velocidade_m_s", "estacionaria_desde",
+        "velocidade_m_s", "estacionaria_desde", "confirmada",
+        "ancora_x", "ancora_y", "obs_estacionarias",
     )
     def __init__(self, x, y, faixa_id):
         agora = time.time()
@@ -293,9 +296,20 @@ class BolaConhecida:
         self.ultima_visao = agora
         self.faixa_id = faixa_id
         self.velocidade_m_s = float("inf")
-        self.estacionaria_desde = None
+        self.estacionaria_desde = agora
+        self.ancora_x = x
+        self.ancora_y = y
+        self.obs_estacionarias = 1
+        self.confirmada = False
 
     def atualizar(self, x: float, y: float, agora: float):
+        if self.confirmada:
+            # Depois de confirmada, preserva exatamente o ponto onde a bola
+            # esteve parada, mesmo que mais tarde seja atingida ou movida.
+            self.n_obs += 1
+            self.ultima_visao = agora
+            return
+
         dt = max(agora - self.ultima_visao, 1e-3)
         dist = ((self.x - x) ** 2 + (self.y - y) ** 2) ** 0.5
         velocidade_inst = dist / dt
@@ -312,24 +326,30 @@ class BolaConhecida:
         self.n_obs += 1
         self.ultima_visao = agora
 
-        if self.velocidade_m_s <= VELOCIDADE_MAX_PARADA_M_S:
-            if self.estacionaria_desde is None:
-                self.estacionaria_desde = agora
+        dist_ancora = ((x - self.ancora_x) ** 2 + (y - self.ancora_y) ** 2) ** 0.5
+        if dist_ancora > RAIO_ESTACIONARIA_BOLA_M:
+            # A candidata deslocou-se: começa uma nova janela de repouso.
+            self.ancora_x = x
+            self.ancora_y = y
+            self.estacionaria_desde = agora
+            self.obs_estacionarias = 1
         else:
-            self.estacionaria_desde = None
+            self.obs_estacionarias += 1
 
     def estavel(self, agora: float | None = None) -> bool:
-        agora = time.time() if agora is None else agora
-        tempo_observada = agora - self.primeira_visao
-        tempo_parada = (
-            0.0 if self.estacionaria_desde is None
-            else agora - self.estacionaria_desde
-        )
-        return (
-            self.n_obs >= N_OBS_MIN_ESTAVEL
-            and tempo_observada >= TEMPO_MIN_ESTAVEL_S
+        if self.confirmada:
+            return True
+
+        tempo_parada = self.ultima_visao - self.estacionaria_desde
+        if (
+            self.obs_estacionarias >= N_OBS_MIN_ESTAVEL
             and tempo_parada >= TEMPO_MIN_ESTAVEL_S
-        )
+        ):
+            self.confirmada = True
+            log("DEBUG",
+                f"Bola confirmada e persistente em ({self.x:.3f},{self.y:.3f})m "
+                f"apos {self.obs_estacionarias} observacoes/{tempo_parada:.2f}s parada.")
+        return self.confirmada
 
 
 class EstadoGrafo:
@@ -340,7 +360,12 @@ class EstadoGrafo:
         self.poligono  = poligono
         self.calib     = calib
         self.bolas     = []                 # list[BolaConhecida]
-        self.robo      = {"frontal": None, "traseiro": None, "orientacao_graus": None}
+        self.robo      = {
+            "frontal": None,
+            "traseiro": None,
+            "orientacao_graus": None,
+            "qualidade_localizacao": {},
+        }
         self.ultimo_indice_processado = -1
         self.ultima_latencia_retificador_ms = None
         self.disparo_ativo = None           # FaixaQuadra atualmente em execução
@@ -390,14 +415,13 @@ def deduplicar_e_atualizar(estado: EstadoGrafo, bolas_novas: list[dict]):
       - se existe, atualiza posição com média acumulativa
       - senão, regista como nova
     Bolas fora do polígono são ignoradas.
+
+    Antes do disparo, uma bola detetada dentro da quadra fica persistente:
+    falhas temporárias do YOLO não removem a bola do estado. A remoção
+    acontece só por recolha/proximidade do robô durante a execução.
     """
     with estado.lock:
         agora = time.time()
-        if estado.bolas:
-            estado.bolas = [
-                bc for bc in estado.bolas
-                if (agora - bc.ultima_visao) <= TEMPO_EXPIRAR_BOLA_S or bc.estavel(agora)
-            ]
 
         for b in bolas_novas:
             x, y = float(b["x"]), float(b["y"])
@@ -464,40 +488,34 @@ def verificar_disparo(estado: EstadoGrafo) -> FaixaQuadra | None:
 
 
 def consumar_disparo(estado: EstadoGrafo, faixa: FaixaQuadra, motivo: str = "concluído"):
-    """Limpa peso e bolas da faixa, marca-a como livre."""
+    """Marca a faixa como livre sem apagar bolas que a visão ainda não confirmou como recolhidas."""
     with estado.lock:
-        n_removidas = 0
-        novas_bolas = []
-        for bc in estado.bolas:
-            if bc.faixa_id == faixa.id:
-                n_removidas += 1
-            else:
-                novas_bolas.append(bc)
-        estado.bolas = novas_bolas
         faixa.peso = 0
         faixa.em_execucao = False
         estado.disparo_ativo = None
         estado.fase_varrimento = None
-        log("HUMANO", f"Faixa {faixa.label} {motivo} — {n_removidas} bola(s) removida(s)")
+        log("HUMANO",
+            f"Faixa {faixa.label} {motivo}. Bolas mantidas no estado salvo as "
+            f"recolhidas por proximidade ao robô.")
 
 
 # ─────────────────────────────────────────────
 #  DETECÇÃO DE CHEGADA DO ROBÔ (VISÃO / ArUco)
 # ─────────────────────────────────────────────
-def _centro_robo(robo: dict) -> tuple[float, float] | None:
+def _posicao_robo(robo: dict) -> tuple[float, float] | None:
     """
-    Devolve o ponto central do robô (média entre traseiro e frontal),
-    ou None se não houver detecção fiável de ambos os marcadores ArUco.
-    Usar o centro é o compromisso natural — a traseira foi adoptada como
-    "posição actual" para gerar a trajetória, mas para verificar se ele
-    chegou ao destino o frontal está mais próximo do alvo. O centro
-    representa o robô como um todo.
+    Devolve a posição usada pelo servidor para o robô: ArUco frontal.
+    A orientação continua a usar frontal-traseiro em _vetor_robo().
     """
-    f = robo.get("frontal")
-    t = robo.get("traseiro")
-    if not f or not t:
+    qualidade = robo.get("qualidade_localizacao") or {}
+    if str(qualidade.get("fonte", "ARUCO")).upper() == "COR" and not qualidade.get(
+        "valida_controle", False
+    ):
         return None
-    return ((f["x"] + t["x"]) / 2.0, (f["y"] + t["y"]) / 2.0)
+    f = robo.get("frontal")
+    if not f:
+        return None
+    return (f["x"], f["y"])
 
 
 def _vetor_robo(robo: dict) -> tuple[float, float] | None:
@@ -505,6 +523,11 @@ def _vetor_robo(robo: dict) -> tuple[float, float] | None:
     Vetor de orientação do robô = (frontal − traseiro), NÃO normalizado.
     None se faltar algum marcador.
     """
+    qualidade = robo.get("qualidade_localizacao") or {}
+    if str(qualidade.get("fonte", "ARUCO")).upper() == "COR" and not qualidade.get(
+        "valida_controle", False
+    ):
+        return None
     f = robo.get("frontal")
     t = robo.get("traseiro")
     if not f or not t:
@@ -533,6 +556,41 @@ def _distancia(p1: tuple[float, float], p2: tuple[float, float]) -> float:
     return ((p1[0] - p2[0]) ** 2 + (p1[1] - p2[1]) ** 2) ** 0.5
 
 
+def remover_bolas_recolhidas_por_robo(estado: EstadoGrafo) -> int:
+    """
+    Durante a execução a lista de bolas fica congelada face ao YOLO. A única
+    remoção permitida é por evidência geométrica: ArUco frontal passou perto.
+    """
+    with estado.lock:
+        pos_robo = _posicao_robo(estado.robo)
+        if pos_robo is None or not estado.bolas:
+            return 0
+
+        mantidas = []
+        removidas = []
+        for bc in estado.bolas:
+            if _distancia(pos_robo, (bc.x, bc.y)) <= RAIO_RECOLHA_BOLA_M:
+                removidas.append(bc)
+            else:
+                mantidas.append(bc)
+
+        if not removidas:
+            return 0
+
+        estado.bolas = mantidas
+        for f in estado.faixas:
+            f.peso = 0
+        agora = time.time()
+        for bc in estado.bolas:
+            if 0 <= bc.faixa_id < len(estado.faixas) and bc.estavel(agora):
+                estado.faixas[bc.faixa_id].peso += 1
+
+        log("EVENTO",
+            f"{len(removidas)} bola(s) removida(s) por proximidade ao robô "
+            f"(raio={RAIO_RECOLHA_BOLA_M*100:.0f}cm).")
+        return len(removidas)
+
+
 def verificar_progresso_varrimento(estado: EstadoGrafo):
     """
     Chamada a cada novo pacote enquanto há disparo ativo. Avança a máquina
@@ -553,13 +611,15 @@ def verificar_progresso_varrimento(estado: EstadoGrafo):
             consumar_disparo(estado, faixa, motivo="libertada (timeout)")
             return
 
-        centro = _centro_robo(estado.robo)
-        if centro is None:
+        pos_robo = _posicao_robo(estado.robo)
+        if pos_robo is None:
             # Sem detecção do robô neste frame — só esperamos próximo frame
             return
 
+        remover_bolas_recolhidas_por_robo(estado)
+
         if estado.fase_varrimento == "aguarda_inicio":
-            d = _distancia(centro, faixa.pos_inicial)
+            d = _distancia(pos_robo, faixa.pos_inicial)
             if d > TOLERANCIA_DISTANCIA_AO_PONTO:
                 return  # ainda não chegou
 
@@ -588,7 +648,7 @@ def verificar_progresso_varrimento(estado: EstadoGrafo):
                            f"(d={d*100:.1f}cm, ângulo={ang:.1f}°) — VARRIMENTO INICIADO.")
 
         elif estado.fase_varrimento == "em_varrimento":
-            d = _distancia(centro, faixa.pos_final)
+            d = _distancia(pos_robo, faixa.pos_final)
             if d <= TOLERANCIA_DISTANCIA_AO_PONTO:
                 log("EVENTO", f"Robô no ponto final da faixa {faixa.label} "
                                f"(d={d*100:.1f}cm).")
@@ -697,14 +757,14 @@ def gerar_artefactos_disparo(estado: EstadoGrafo, faixa: FaixaQuadra):
         cv2.circle(img, (px, py), raio_out, (0, 0, 0), 1)
 
     # ── Trajetória de referência: robô → inicial → final ─────
-    # Segmento 1: posição atual do robô (traseira) → ponto inicial da faixa
+    # Segmento 1: posição atual do robô (ArUco frontal) → ponto inicial da faixa
     # Segmento 2: ponto inicial → ponto final (varrimento da faixa)
     px_ini, py_ini = _m_para_px(*faixa.pos_inicial, calib)
     px_fim, py_fim = _m_para_px(*faixa.pos_final,   calib)
 
-    if robo.get("traseiro"):
-        rtx = robo["traseiro"]["x"];  rty = robo["traseiro"]["y"]
-        px_robo, py_robo = _m_para_px(rtx, rty, calib)
+    if robo.get("frontal"):
+        rfx = robo["frontal"]["x"];  rfy = robo["frontal"]["y"]
+        px_robo, py_robo = _m_para_px(rfx, rfy, calib)
         # Segmento de aproximação (cor diferente para distinguir do varrimento)
         cv2.arrowedLine(img, (px_robo, py_robo), (px_ini, py_ini),
                         (0, 200, 255), 2, tipLength=0.05)   # ciano
@@ -761,10 +821,11 @@ def gerar_artefactos_disparo(estado: EstadoGrafo, faixa: FaixaQuadra):
 
     # ── JSON da trajetória (DOIS SEGMENTOS SEPARADOS) ────────
     pos_robo_atual = None
-    if robo.get("traseiro"):
+    if robo.get("frontal"):
         pos_robo_atual = {
-            "x": round(robo["traseiro"]["x"], 4),
-            "y": round(robo["traseiro"]["y"], 4),
+            "x": round(robo["frontal"]["x"], 4),
+            "y": round(robo["frontal"]["y"], 4),
+            "referencia": "aruco_frontal",
         }
     pt_inicial = {"x": round(faixa.pos_inicial[0], 4),
                   "y": round(faixa.pos_inicial[1], 4)}
@@ -793,7 +854,7 @@ def gerar_artefactos_disparo(estado: EstadoGrafo, faixa: FaixaQuadra):
             {
                 "ordem":      1,
                 "tipo":       "aproximacao",
-                "descricao":  "Posição atual do robô (traseira) → ponto inicial da faixa. "
+                "descricao":  "Posição atual do robô (ArUco frontal) → ponto inicial da faixa. "
                               "Ao chegar, o robô deve estar APONTADO PARA A DIREITA "
                               "(alinhado com o vetor de orientação alvo).",
                 "origem":     pos_robo_atual,
@@ -868,13 +929,12 @@ def calcular_rota_global(estado: EstadoGrafo):
         bolas = _bolas_estaveis_metros(estado)
 
     frontal  = robo.get("frontal")
-    traseiro = robo.get("traseiro")
-    if not frontal or not traseiro:
+    if not frontal:
         log("AVISO", "Modo GLOBAL: aguardando ArUco para calcular rota...")
         return
 
-    cx = (frontal["x"] + traseiro["x"]) / 2.0
-    cy = (frontal["y"] + traseiro["y"]) / 2.0
+    cx = frontal["x"]
+    cy = frontal["y"]
 
     if not bolas:
         log("AVISO", "Modo GLOBAL: sem bolas estáveis para planear rota — reset.")
@@ -918,11 +978,13 @@ def verificar_progresso_global(estado: EstadoGrafo):
             _concluir_global(estado)
             return
 
-        centro = _centro_robo(estado.robo)
-        if centro is None:
+        pos_robo = _posicao_robo(estado.robo)
+        if pos_robo is None:
             return  # sem ArUco neste frame
 
-        dist = _distancia(centro, wp)
+        remover_bolas_recolhidas_por_robo(estado)
+
+        dist = _distancia(pos_robo, wp)
         if dist <= TOLERANCIA_DISTANCIA_AO_PONTO:
             tem_mais = estado.planner_global.avancar_waypoint()
             if not tem_mais:
@@ -931,15 +993,14 @@ def verificar_progresso_global(estado: EstadoGrafo):
 
 def _concluir_global(estado: EstadoGrafo):
     """Limpa o estado GLOBAL e volta a acumular bolas com YOLO ativo."""
-    # Remover todas as bolas que foram apanhadas
-    n_removidas = len(estado.bolas)
-    estado.bolas = []
     for f in estado.faixas:
         f.peso = 0
+    recalcular_pesos(estado)
+    n_restantes = len(estado.bolas)
     estado.planner_global.cancelar()
     estado.fase_global = "aguardar"
     log("EVENTO",
-        f"Rota GLOBAL concluída — {n_removidas} bola(s) removida(s). "
+        f"Rota GLOBAL concluída — {n_restantes} bola(s) ainda no estado. "
         f"YOLO retomado. A aguardar novo threshold...")
 
 
@@ -1006,10 +1067,19 @@ def broadcast_estado(estado: "EstadoGrafo"):
             faixa_label  = None
             wp           = estado.planner_global.waypoint_atual()
             alvo_destino = {"x": wp[0], "y": wp[1]} if wp else None
+            waypoints_completos = [
+                {"x": float(x), "y": float(y)}
+                for x, y in estado.planner_global._waypoints
+            ]
             extra = {
                 "waypoint_idx":        estado.planner_global.idx_atual,
                 "waypoints_total":     estado.planner_global.n_waypoints,
                 "waypoints_restantes": estado.planner_global.waypoints_restantes,
+                "waypoints":           waypoints_completos,
+                "trajetoria_id":       (
+                    f"global:{int(estado.t_global_iniciado * 1000)}"
+                    if fase_global == "executar" else None
+                ),
             }
         else:
             # Modo FAIXAS — igual ao original
@@ -1205,19 +1275,18 @@ class VisualizadorAoVivo:
                              markeredgewidth=0.4, zorder=6)
 
         # Robô (cor depende do estado de alinhamento durante aguarda_inicio)
-        robo_traseiro = None
+        robo_posicao = None
         if robo.get("frontal") and robo.get("traseiro"):
             rfx = robo["frontal"]["x"];   rfy = robo["frontal"]["y"]
             rtx = robo["traseiro"]["x"];  rty = robo["traseiro"]["y"]
-            robo_traseiro = (rtx, rty)
+            robo_posicao = (rfx, rfy)
 
             # Decidir cor: durante aguarda_inicio mostramos verde se já está
             # alinhado e perto do ponto inicial, vermelho se ainda não.
             cor_robo = "#ff8030"   # default
             if disparo is not None and fase == "aguarda_inicio":
-                centro_r = ((rfx + rtx)/2, (rfy + rty)/2)
-                dist = ((centro_r[0]-disparo.pos_inicial[0])**2 +
-                        (centro_r[1]-disparo.pos_inicial[1])**2) ** 0.5
+                dist = ((rfx-disparo.pos_inicial[0])**2 +
+                        (rfy-disparo.pos_inicial[1])**2) ** 0.5
                 v_alvo = (disparo.pos_final[0]-disparo.pos_inicial[0],
                           disparo.pos_final[1]-disparo.pos_inicial[1])
                 v_robo = (rfx - rtx, rfy - rty)
@@ -1235,10 +1304,10 @@ class VisualizadorAoVivo:
 
         # Trajetória de 3 pontos (se disparo ativo — MODO FAIXAS)
         if disparo is not None:
-            # Segmento 1: robô → inicial (aproximação)
-            if robo_traseiro is not None:
+            # Segmento 1: ArUco frontal → inicial (aproximação)
+            if robo_posicao is not None:
                 self.ax.annotate("",
-                                 xy=disparo.pos_inicial, xytext=robo_traseiro,
+                                 xy=disparo.pos_inicial, xytext=robo_posicao,
                                  arrowprops=dict(arrowstyle="->",
                                                  color="#33ccff", lw=2,
                                                  linestyle="--"),
@@ -1267,10 +1336,10 @@ class VisualizadorAoVivo:
         if modo_op == "GLOBAL" and waypoints:
             # Desenhar todos os segmentos da rota (cinzento fino)
             pts = waypoints
-            if robo_traseiro is not None and wp_idx < len(pts):
-                # Seta robô → waypoint atual (destaque)
+            if robo_posicao is not None and wp_idx < len(pts):
+                # Seta ArUco frontal → waypoint atual (destaque)
                 self.ax.annotate("",
-                                 xy=pts[wp_idx], xytext=robo_traseiro,
+                                 xy=pts[wp_idx], xytext=robo_posicao,
                                  arrowprops=dict(arrowstyle="->",
                                                  color="#33ccff", lw=2,
                                                  linestyle="--"),
@@ -1358,6 +1427,9 @@ def processar_pacote(estado: EstadoGrafo, pacote: dict):
                 "frontal":          robo.get("frontal"),
                 "traseiro":         robo.get("traseiro"),
                 "orientacao_graus": robo.get("orientacao_graus"),
+                "qualidade_localizacao": dict(
+                    robo.get("qualidade_localizacao") or {}
+                ),
             }
         estado.ultimo_indice_processado = indice
         estado.ultima_latencia_retificador_ms = pacote.get("latencia_ms")
@@ -1397,9 +1469,10 @@ def processar_pacote(estado: EstadoGrafo, pacote: dict):
 # ─────────────────────────────────────────────
 def main():
     global N_FAIXAS, RAIO_DEDUP_M, THRESHOLD_PCT, K_MIN, N_OBS_MIN_ESTAVEL
-    global TEMPO_MIN_ESTAVEL_S, VELOCIDADE_MAX_PARADA_M_S, TEMPO_EXPIRAR_BOLA_S
+    global TEMPO_MIN_ESTAVEL_S, VELOCIDADE_MAX_PARADA_M_S, RAIO_ESTACIONARIA_BOLA_M
+    global TEMPO_EXPIRAR_BOLA_S
     global TOLERANCIA_DISTANCIA_AO_PONTO, TOLERANCIA_ANGULO_GRAUS
-    global TIMEOUT_VARRIMENTO_S, MODO_OPERACAO, K_MIN_GLOBAL, _CFG
+    global TIMEOUT_VARRIMENTO_S, RAIO_RECOLHA_BOLA_M, MODO_OPERACAO, K_MIN_GLOBAL, _CFG
 
     parser = argparse.ArgumentParser(description="GraphProcessor UFSC/FEUP")
     parser.add_argument("--no-vis", action="store_true",
@@ -1418,6 +1491,10 @@ def main():
         "velocidade_max_bola_parada_cm_s",
         VELOCIDADE_MAX_PARADA_M_S * 100,
     )) / 100.0
+    RAIO_ESTACIONARIA_BOLA_M       = float(_CFG.get(
+        "raio_confirmar_bola_parada_cm",
+        RAIO_ESTACIONARIA_BOLA_M * 100,
+    )) / 100.0
     TEMPO_EXPIRAR_BOLA_S           = float(_CFG.get("tempo_expirar_bola_s", TEMPO_EXPIRAR_BOLA_S))
     TOLERANCIA_DISTANCIA_AO_PONTO  = float(_CFG.get("tolerancia_distancia_cm",
                                                     TOLERANCIA_DISTANCIA_AO_PONTO*100)) / 100.0
@@ -1425,6 +1502,8 @@ def main():
                                                     TOLERANCIA_ANGULO_GRAUS))
     TIMEOUT_VARRIMENTO_S           = float(_CFG.get("timeout_varrimento_s",
                                                     TIMEOUT_VARRIMENTO_S))
+    RAIO_RECOLHA_BOLA_M            = float(_CFG.get("raio_recolha_bola_cm",
+                                                    RAIO_RECOLHA_BOLA_M*100)) / 100.0
     MODO_OPERACAO                  = str(_CFG.get("modo_operacao", MODO_OPERACAO)).upper()
     K_MIN_GLOBAL                   = int(_CFG.get("k_min_global", K_MIN_GLOBAL))
 
@@ -1452,7 +1531,8 @@ def main():
                 f"v_parada≤{VELOCIDADE_MAX_PARADA_M_S*100:.1f}cm/s")
     log("DEBUG", f"  tolerância distância={TOLERANCIA_DISTANCIA_AO_PONTO*100:.0f}cm | "
                 f"alinhamento={TOLERANCIA_ANGULO_GRAUS:.0f}° | "
-                f"timeout varrimento={TIMEOUT_VARRIMENTO_S:.0f}s")
+                f"timeout varrimento={TIMEOUT_VARRIMENTO_S:.0f}s | "
+                f"raio recolha bola={RAIO_RECOLHA_BOLA_M*100:.0f}cm")
 
     # Threads
     parar = threading.Event()
@@ -1511,11 +1591,11 @@ def main():
                                 estado.disparo_ativo = faixa
                                 estado.t_disparo_iniciado = time.time()
                                 estado._avisou_alinhamento = False
-                                centro = _centro_robo(estado.robo)
+                                pos_robo = _posicao_robo(estado.robo)
                                 v_robo = _vetor_robo(estado.robo)
                                 ja_la = False
-                                if centro is not None and v_robo is not None:
-                                    d = _distancia(centro, faixa.pos_inicial)
+                                if pos_robo is not None and v_robo is not None:
+                                    d = _distancia(pos_robo, faixa.pos_inicial)
                                     v_alvo = (faixa.pos_final[0] - faixa.pos_inicial[0],
                                               faixa.pos_final[1] - faixa.pos_inicial[1])
                                     ang = _alinhamento_graus(v_alvo, v_robo)

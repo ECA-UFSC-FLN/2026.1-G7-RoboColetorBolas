@@ -96,6 +96,31 @@ def _carregar_intrinsicos() -> tuple:
 # Cache dos mapas de undistort (calculados uma vez por (K,D,resolução)).
 _UNDISTORT_MAPS: dict = {}
 
+
+def escalar_intrinsicos_para_frame(K, resolucao_ref, w: int, h: int):
+    """Adapta K ao frame assumindo redimensionamento com recorte central.
+
+    Os perfis embutidos descrevem a fotografia 4:3 do sensor, enquanto o
+    stream da câmara é normalmente 16:9. Nesse caso a imagem é ampliada com
+    a mesma escala nos dois eixos e o excedente é recortado ao centro. Usar K
+    4:3 diretamente num frame 16:9 deixa o ponto principal fora da imagem e
+    torna a correção de altura do ArUco fortemente errada.
+    """
+    ref_w, ref_h = int(resolucao_ref[0]), int(resolucao_ref[1])
+    if ref_w <= 0 or ref_h <= 0 or w <= 0 or h <= 0:
+        raise ValueError("Resolução inválida ao escalar intrínsecos")
+
+    escala = max(w / float(ref_w), h / float(ref_h))
+    desloc_x = (ref_w * escala - w) / 2.0
+    desloc_y = (ref_h * escala - h) / 2.0
+
+    K_frame = np.array(K, dtype=np.float64, copy=True)
+    K_frame[0, 0] *= escala
+    K_frame[1, 1] *= escala
+    K_frame[0, 2] = K_frame[0, 2] * escala - desloc_x
+    K_frame[1, 2] = K_frame[1, 2] * escala - desloc_y
+    return K_frame
+
 def _obter_maps_undistort(K, D, w: int, h: int):
     chave = (w, h, id(K))   # id(K) diferencia perfis distintos na mesma sessão
     if chave not in _UNDISTORT_MAPS:
@@ -252,8 +277,8 @@ def _worker_escrita():
             tipo = tarefa.get("tipo")
 
             if tipo == "json":
-                with open(tarefa["caminho"], "w") as _f:
-                    json.dump(tarefa["dados"], _f, indent=4)
+                with open(tarefa["caminho"], "w", encoding="utf-8") as _f:
+                    json.dump(tarefa["dados"], _f, separators=(",", ":"))
 
             elif tipo == "jpeg":
                 ok_w, buf_w = cv2.imencode(
@@ -435,7 +460,7 @@ def calibrar_via_socket():
     except Exception:
         pass
 
-    K, D, res, cfg = _carregar_intrinsicos()
+    K_ref, D, res, cfg = _carregar_intrinsicos()
 
     log("HUMANO", "Servidor de calibração ativo na porta 6001")
     log("HUMANO", "Aguardando frame do imageStreaming... (captura com tecla C)")
@@ -446,6 +471,10 @@ def calibrar_via_socket():
             img    = pacote["frame"]
     log("HUMANO", "Frame recebido. A preparar janela de calibração...")
 
+    h_frame, w_frame = img.shape[:2]
+    K = escalar_intrinsicos_para_frame(K_ref, res, w_frame, h_frame)
+    log("DEBUG", f"Intrínsecos ajustados por recorte central para "
+                 f"{w_frame}×{h_frame}px | centro=({K[0,2]:.1f},{K[1,2]:.1f})")
     img_undist = aplicar_undistort(img, K, D)
     h_img, w_img = img_undist.shape[:2]
 
@@ -813,6 +842,9 @@ def calibrar_via_socket():
         "erro_medio_px":   round(erro_medio_px, 3),
         "erro_medio_m":    round(erro_medio_m,  5),
         "resolucao_calib": [w_img, h_img],
+        "intrinsics_ajustados_resolucao": True,
+        "intrinsics_modelo_escala": "CENTER_CROP",
+        "intrinsics_resolucao_ref": res,
         "perfil_camara":   perfil_calib,
         "homografia_usa_frame_undistort": True,
         "data":            datetime.now().isoformat(timespec="seconds"),
@@ -909,7 +941,23 @@ def calibrar_via_socket():
 #  MODO PRODUÇÃO
 # ═════════════════════════════════════════════════════════════════════
 def servidor_producao(calib: dict):
-    K, D, res, cfg = _carregar_intrinsicos()
+    K_ref, D, res, cfg = _carregar_intrinsicos()
+
+    if not calib.get("intrinsics_ajustados_resolucao"):
+        log("ERRO", "A homografia atual foi criada antes da correção de escala "
+                    "dos intrínsecos. Executa novamente a calibração da quadra "
+                    "antes de iniciar a produção.")
+        sys.exit(1)
+
+    res_calib = calib.get("resolucao_calib")
+    if not res_calib or len(res_calib) != 2:
+        log("ERRO", "Calibração sem resolucao_calib. Recalibra a quadra.")
+        sys.exit(1)
+    K = escalar_intrinsicos_para_frame(
+        K_ref, res, int(res_calib[0]), int(res_calib[1]))
+    log("DEBUG", f"Intrínsecos de produção ajustados para "
+                 f"{res_calib[0]}×{res_calib[1]}px | "
+                 f"centro=({K[0,2]:.1f},{K[1,2]:.1f})")
 
     H     = np.array(calib["H_mat"])
     H_metros = (np.array(calib["H_metros_mat"])
@@ -1006,6 +1054,9 @@ def servidor_producao(calib: dict):
             "frontal":          None,
             "traseiro":         None,
             "orientacao_graus": robo_px.get("orientacao_graus"),
+            "qualidade_localizacao": dict(
+                robo_px.get("qualidade_localizacao") or {}
+            ),
         }
         if robo_px.get("frontal"):
             xm, ym = _px_para_metros(
@@ -1025,6 +1076,17 @@ def servidor_producao(calib: dict):
                 H_metros=H_metros,
             )
             res_robo["traseiro"] = {"x": xm, "y": ym}
+
+        # A orientação em pixéis sofre com a perspetiva. Depois de retificar
+        # os dois marcadores, recalculá-la no referencial métrico mantém a mesma
+        # convenção usada pelo supervisor: atan2(y, x), traseiro -> frontal.
+        if res_robo["frontal"] and res_robo["traseiro"]:
+            dx_m = res_robo["frontal"]["x"] - res_robo["traseiro"]["x"]
+            dy_m = res_robo["frontal"]["y"] - res_robo["traseiro"]["y"]
+            res_robo["orientacao_graus"] = round(
+                float(np.degrees(np.arctan2(dy_m, dx_m))), 2)
+            res_robo["qualidade_localizacao"]["distancia_centros_m"] = round(
+                float(np.hypot(dx_m, dy_m)), 4)
 
         robo_log = "—"
         if res_robo["frontal"] or res_robo["traseiro"]:

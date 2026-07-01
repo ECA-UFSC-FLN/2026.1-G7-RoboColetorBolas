@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.log
+
+src/resultados/posicoes/
+src/resultados/imagens/
+src/resultados/imagens_topdown/
+src/resultados/trajetorias/
+src/resultados/**/*.png
+src/resultados/**/*.jpg
+src/resultados/**/*.jpeg
+src/resultados/**/*.mp4

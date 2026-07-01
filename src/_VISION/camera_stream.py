@@ -287,9 +287,12 @@ def enviar_para_calibracao(frame) -> bool:
 # ─────────────────────────────────────────────
 def desenhar_overlay(frame, stats: dict, modo: str, pausado: bool):
     h, w = frame.shape[:2]
-    overlay = frame.copy()
-    cv2.rectangle(overlay, (0, 0), (min(w, 760), 88), (0, 0, 0), -1)
-    cv2.addWeighted(overlay, 0.45, frame, 0.55, 0, frame)
+    largura = min(w, 760)
+    altura = min(h, 88)
+    roi = frame[:altura, :largura].copy()
+    cv2.rectangle(roi, (0, 0), (largura, altura), (0, 0, 0), -1)
+    cv2.addWeighted(roi, 0.45, frame[:altura, :largura], 0.55, 0,
+                    frame[:altura, :largura])
 
     if modo == "CALIBRACAO":
         teclas = "C: Capturar frame de calibracao  |  E: Sair  |  I: Info"
@@ -327,6 +330,9 @@ def desenhar_overlay(frame, stats: dict, modo: str, pausado: bool):
 # ─────────────────────────────────────────────
 def stream():
     cfg = _params.carregar()
+    modo_localizacao_robo = str(
+        cfg.get("modo_localizacao_robo", "ARUCO")
+    ).upper()
     largura_processamento = int(cfg.get("processamento_largura_px", 960))
     largura_aruco_envio = int(cfg.get("aruco_largura_px", 640))
     enviar_debug_original = bool(int(cfg.get("guardar_imagens_debug", 0)))
@@ -433,7 +439,8 @@ def stream():
         ).start()
         log("DEBUG", f"Processamento: largura={largura_processamento}px "
                      f"(0 = resolução original).")
-        log("DEBUG", f"ArUco: largura de envio={largura_aruco_envio}px "
+        log("DEBUG", f"Localização do robô={modo_localizacao_robo} | "
+                     f"largura de envio={largura_aruco_envio}px "
                      f"(0 = resolução original).")
 
     while True:
@@ -512,12 +519,15 @@ def stream():
                 frame_aruco, sx_aruco, sy_aruco = preparar_frame_producao(
                     frame, largura_aruco_envio
                 )
-                frame_aruco = cv2.cvtColor(frame_aruco, cv2.COLOR_BGR2GRAY)
+                frame_gray = modo_localizacao_robo != "COR"
+                if frame_gray:
+                    frame_aruco = cv2.cvtColor(frame_aruco, cv2.COLOR_BGR2GRAY)
                 indice_atual = indice_envio
                 indice_envio += 1
                 pacote_aruco = {
                     "frame": frame_aruco,
-                    "frame_gray": True,
+                    "frame_gray": frame_gray,
+                    "modo_localizacao_robo": modo_localizacao_robo,
                     "timestamp": agora_pacote,
                     "nome": "cam_principal",
                     "escala_origem_x": sx_aruco,
@@ -532,7 +542,7 @@ def stream():
                     frame_proc, sx, sy = preparar_frame_producao(
                         frame, largura_processamento
                     )
-                    pacote_base = {
+                    pacote_yolo = {
                         "frame": frame_proc,
                         "timestamp": agora_pacote,
                         "nome": "cam_principal",
@@ -541,7 +551,6 @@ def stream():
                         "resolucao_original": [w_real, h_real],
                         "indice": indice_atual,
                     }
-                    pacote_yolo = dict(pacote_base)
                     if enviar_debug_original and agora_pacote >= proximo_debug_original:
                         pacote_yolo["frame_debug_original"] = frame.copy()
                         proximo_debug_original = agora_pacote + intervalo_debug_original_s

@@ -1,55 +1,26 @@
-# 📘 Guia de Uso do GitHub para Equipes Semestrais
+# Coletor de Bolas UFSC/FEUP
 
-Bem-vindos ao repositório de projetos ECA UFSC! 🎉  
-Este guia explica como organizar o trabalho da sua equipe usando GitHub. Siga estas orientações para garantir consistência e colaboração eficiente.  
+Sistema de visão, planeamento e controlo para detetar bolas de ténis, estimar
+a pose do robô, gerar uma trajetória e supervisionar a execução pelo ESP32.
 
-No início do semestre, cada equipe deve criar o próprio repositório a partir do template oferecido: 
+## Instalação
 
-Vá até project-template
-- Clique em “Use this template” → “Create a new repository”
-- Nomeie o repositório no padrão:
-- 2025.2-equipe1-nome-do-projeto
+Segue o tutorial completo em [INSTALACAO.md](INSTALACAO.md).
 
-Mantenha um README conforme estrutura a seguir:
+Resumo para Windows:
 
----
+```powershell
+git clone https://github.com/ECA-UFSC-FLN/2026.1-G7-RoboColetorBolas.git
+cd 2026.1-G7-RoboColetorBolas\src
+py -3.12 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r ..\requirements.txt
+.\ASTART.bat
+```
 
-# 📌 Nome do Projeto
+## Estrutura
 
-Breve descrição do projeto (o que ele faz, para quem é, objetivo principal).
+- `src/`: aplicação Python, firmware ESP32, configuração e modelos YOLO.
+- `hardware/`: documentação de hardware.
+- `docs/`: documentação e entregas do projeto.
 
----
-
-## 👥 Integrantes da Equipe
-- Nome do Aluno 1 (Função)  
-- Nome do Aluno 2 (Função)  
-- Nome do Aluno 3 (Função)  
-- Nome do Aluno 4 (Função)  
-
----
-
-## 🗓 Semestre
-- **Ano/Semestre:** 2025.2  
-- **Equipe:** Equipe 1  
-
----
-
-## 🚀 Como Executar o Projeto
-
-### Pré-requisitos
-- [ ] Instalar **Node.js** (versão XX) ou **Python** (versão XX)  
-- [ ] Instalar dependências  
-
-### Passos
-```bash
-# Clonar o repositório
-git clone https://github.com/projetos-eca/2025.2-equipe1-nome-projeto.git
-
-# Acessar a pasta
-cd 2025.1-equipe1-nome-projeto
-
-# Instalar dependências (exemplo em Node.js)
-npm install
-
-# Executar
-npm start
+O modelo usado em produção está em `src/models/balls_best.pt`.
