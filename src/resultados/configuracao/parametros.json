@@ -54,5 +54,6 @@
     "supervisor_assentamento_orientacao_s": 0.45,
     "supervisor_margem_liberacao_angulo_graus": 3.0,
     "supervisor_max_reenvios_orient_goal": 20,
-    "raio_recolha_bola_cm": 25.0
+    "raio_recolha_bola_cm": 25.0,
+    "modo_correcao_orientacao_esp32": "PRIMEIRA_DEVAGAR"
 }

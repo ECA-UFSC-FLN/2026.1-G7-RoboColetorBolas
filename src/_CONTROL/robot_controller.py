@@ -41,6 +41,7 @@ TIMEOUT_FEEDBACK_S = 6.0
 MAX_REENVIOS_ORIENT_GOAL = 20
 ORIENTATION_SETTLE_S = 0.45
 MODO_SUPERVISAO_UDP = "PONTO_A_PONTO"
+MODO_CORRECAO_ORIENTACAO_ESP32 = "PRIMEIRA_DEVAGAR"
 
 MOD = "CONTROLADOR"
 
@@ -159,6 +160,7 @@ def _pacote_base(tipo: str, segment_id: str | None, estado: dict, metricas: dict
         "phase": estado.get("fase"),
         "trajectory_id": estado.get("trajetoria_id"),
         "rectifier_latency_ms": estado.get("latencia_retificador_ms"),
+        "orientation_correction_mode": MODO_CORRECAO_ORIENTACAO_ESP32,
     }
     if metricas is not None:
         pacote.update({
@@ -279,6 +281,7 @@ def main():
     global DESVIO_MOVIMENTO_ANGULO_GRAUS, DESVIO_MOVIMENTO_DISTANCIA_M
     global REENVIAR_META_S, TIMEOUT_FEEDBACK_S, MAX_REENVIOS_ORIENT_GOAL
     global ORIENTATION_SETTLE_S, MODO_SUPERVISAO_UDP
+    global MODO_CORRECAO_ORIENTACAO_ESP32
 
     parser = argparse.ArgumentParser(description="Supervisor UDP do Robo - UFSC/FEUP")
     parser.add_argument("--ip", default=None, help="IP do ESP32")
@@ -331,6 +334,10 @@ def main():
     MODO_SUPERVISAO_UDP = str(
         cfg.get("modo_supervisao_udp", MODO_SUPERVISAO_UDP)
     ).upper()
+    MODO_CORRECAO_ORIENTACAO_ESP32 = str(cfg.get(
+        "modo_correcao_orientacao_esp32",
+        MODO_CORRECAO_ORIENTACAO_ESP32,
+    )).upper()
 
     iniciar_health_server()
     modo_simulado = not _ip_valido(IP_ROBO)
@@ -340,6 +347,7 @@ def main():
         log("HUMANO", f"ESP32 comandos: {IP_ROBO}:{PORTA_ROBO_UDP}")
     log("HUMANO", f"ESP32 feedback: UDP local :{PORTA_FEEDBACK_UDP}")
     log("HUMANO", f"Modo supervisor UDP: {MODO_SUPERVISAO_UDP}")
+    log("HUMANO", f"Correcao angular ESP32: {MODO_CORRECAO_ORIENTACAO_ESP32}")
     log("DEBUG",
         f"tolerancias: alvo={TOLERANCIA_DISTANCIA_M*100:.0f}cm "
         f"orientacao={TOLERANCIA_ANGULO_GRAUS:.0f}deg "

@@ -506,6 +506,17 @@ ESQUEMA: list[dict] = [
         "max":       5.0,
     },
     {
+        "chave":     "modo_correcao_orientacao_esp32",
+        "categoria": "CONTROLADOR",
+        "descricao": "Estratégia de correção angular do ESP32: primeira trajetória lenta, sempre lenta ou sempre rápida",
+        "unidade":   "",
+        "default":   "PRIMEIRA_DEVAGAR",
+        "tipo":      "str",
+        "min":       None,
+        "max":       None,
+        "opcoes":    ["PRIMEIRA_DEVAGAR", "SEMPRE_DEVAGAR", "SEMPRE_RAPIDO"],
+    },
+    {
         "chave":     "k_ang",
         "categoria": "CONTROLADOR",
         "descricao": "Ganho proporcional do erro angular",

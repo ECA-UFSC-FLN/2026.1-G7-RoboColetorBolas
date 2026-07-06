@@ -123,6 +123,7 @@ String segmentId;
 long lastUdpSeq = -1;
 String firstTrajectoryId;
 bool firstTrajectoryCalibration = true;
+String orientationCorrectionMode = "PRIMEIRA_DEVAGAR";
 #endif
 
 // ============================================================
@@ -585,6 +586,9 @@ void udpPoll() {
   const char* type = doc["type"] | "";
   segmentId = (const char*)(doc["segment_id"] | "");
   String trajectoryId = (const char*)(doc["trajectory_id"] | "");
+  orientationCorrectionMode = (const char*)(
+    doc["orientation_correction_mode"] | "PRIMEIRA_DEVAGAR"
+  );
   long commandSeq = doc["seq"] | -1;
 
   if (commandSeq >= 0 && commandSeq <= lastUdpSeq) {
@@ -635,7 +639,10 @@ void udpPoll() {
     }
     float requestedTurn = wrapDeg(VISION_TURN_SIGN * correctionError);
     float localTarget = requestedTurn;
-    if (firstTrajectoryCalibration) {
+    bool useSlowCorrection =
+      orientationCorrectionMode == "SEMPRE_DEVAGAR" ||
+      (orientationCorrectionMode == "PRIMEIRA_DEVAGAR" && firstTrajectoryCalibration);
+    if (useSlowCorrection) {
       localTarget = constrain(
         requestedTurn,
         -MAX_VISION_TURN_STEP_DEG,
@@ -656,7 +663,9 @@ void udpPoll() {
     Serial.print(" requested_turn=");
     Serial.print(requestedTurn, 2);
     Serial.print(" calibration_steps=");
-    Serial.print(firstTrajectoryCalibration ? "ON" : "OFF");
+    Serial.print(useSlowCorrection ? "ON" : "OFF");
+    Serial.print(" correction_mode=");
+    Serial.print(orientationCorrectionMode);
     Serial.print(" local_target=");
     Serial.println(localTarget, 2);
 

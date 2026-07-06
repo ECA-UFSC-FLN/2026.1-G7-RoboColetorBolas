@@ -85,6 +85,12 @@ após o ESP32 arrancar. Quando o servidor envia uma nova `trajectory_id`, o
 ESP32 desativa `firstTrajectoryCalibration` e passa a usar a correção angular
 normal, mantendo a validação ponto a ponto pelo servidor.
 
+O parâmetro `modo_correcao_orientacao_esp32` permite escolher a estratégia:
+
+- `PRIMEIRA_DEVAGAR`: passos de até 10 graus apenas na primeira trajetória;
+- `SEMPRE_DEVAGAR`: passos de até 10 graus em todas as trajetórias;
+- `SEMPRE_RAPIDO`: correção angular completa em todas as trajetórias.
+
 PWM temporariamente reforçado para vencer atrito:
 
 - mínimo esquerdo: 105
