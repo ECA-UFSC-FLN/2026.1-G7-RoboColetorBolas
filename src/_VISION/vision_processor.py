@@ -142,7 +142,6 @@ def loop_cliente_broadcaster():
                         "aguarda_inicio",
                         "em_varrimento",
                         "global_executar",
-                        "aguardar_confirmacao",
                     ))
                     if novo != _em_disparo:
                         _em_disparo = novo

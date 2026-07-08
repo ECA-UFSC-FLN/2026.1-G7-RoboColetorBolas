@@ -36,6 +36,10 @@ MAX_TENTATIVAS_ORIENTACAO = 5
 LEITURAS_DESVIO_CONSECUTIVAS = 3
 DESVIO_MOVIMENTO_ANGULO_GRAUS = 25.0
 DESVIO_MOVIMENTO_DISTANCIA_M = 0.25
+DESVIO_LATERAL_M = 0.08
+RECUPERACAO_PERDA_VISAO_ATIVA = False
+TIMEOUT_PERDA_VISAO_S = 0.6
+DISTANCIA_RECUPERACAO_CM = 30.0
 REENVIAR_META_S = 0.75
 TIMEOUT_FEEDBACK_S = 6.0
 MAX_REENVIOS_ORIENT_GOAL = 20
@@ -110,7 +114,8 @@ def _pose_robo(robo: dict | None) -> dict | None:
     }
 
 
-def _metricas_pose(robo: dict | None, alvo: dict | None) -> dict | None:
+def _metricas_pose(robo: dict | None, alvo: dict | None,
+                   origem: dict | None = None) -> dict | None:
     pose = _pose_robo(robo)
     if pose is None or alvo is None:
         return None
@@ -121,12 +126,22 @@ def _metricas_pose(robo: dict | None, alvo: dict | None) -> dict | None:
     distancia = math.hypot(dx, dy)
     desejado = math.degrees(math.atan2(dy, dx))
     erro = _sinal_angulo_graus(desejado - pose["heading_deg"])
+    desvio_lateral = None
+    if origem is not None:
+        ox = float(origem["x"])
+        oy = float(origem["y"])
+        vx = tx - ox
+        vy = ty - oy
+        norma = math.hypot(vx, vy)
+        if norma > 1e-9:
+            desvio_lateral = abs(vx * (pose["y"] - oy) - vy * (pose["x"] - ox)) / norma
     return {
         "pose": pose,
         "target": {"x": tx, "y": ty},
         "distance_m": distancia,
         "desired_heading_deg": _sinal_angulo_graus(desejado),
         "heading_error_deg": erro,
+        "cross_track_error_m": desvio_lateral,
         "aligned": abs(erro) <= TOLERANCIA_ANGULO_GRAUS,
         "aligned_release": abs(erro) <= (
             TOLERANCIA_ANGULO_GRAUS + MARGEM_LIBERACAO_ANGULO_GRAUS
@@ -279,6 +294,8 @@ def main():
     global MARGEM_LIBERACAO_ANGULO_GRAUS
     global MAX_TENTATIVAS_ORIENTACAO, LEITURAS_DESVIO_CONSECUTIVAS
     global DESVIO_MOVIMENTO_ANGULO_GRAUS, DESVIO_MOVIMENTO_DISTANCIA_M
+    global DESVIO_LATERAL_M, RECUPERACAO_PERDA_VISAO_ATIVA
+    global TIMEOUT_PERDA_VISAO_S, DISTANCIA_RECUPERACAO_CM
     global REENVIAR_META_S, TIMEOUT_FEEDBACK_S, MAX_REENVIOS_ORIENT_GOAL
     global ORIENTATION_SETTLE_S, MODO_SUPERVISAO_UDP
     global MODO_CORRECAO_ORIENTACAO_ESP32
@@ -291,8 +308,7 @@ def main():
                         help="Porta UDP local para eventos do ESP32")
     parser.add_argument("--max-orient", type=int, default=MAX_TENTATIVAS_ORIENTACAO,
                         help="Maximo de tentativas de correcao de orientacao")
-    parser.add_argument("--leituras-desvio", type=int,
-                        default=LEITURAS_DESVIO_CONSECUTIVAS,
+    parser.add_argument("--leituras-desvio", type=int, default=None,
                         help="Leituras consecutivas fora da tolerancia antes de parar")
     args = parser.parse_args()
 
@@ -313,7 +329,11 @@ def main():
         MARGEM_LIBERACAO_ANGULO_GRAUS,
     ))
     MAX_TENTATIVAS_ORIENTACAO = max(1, int(args.max_orient))
-    LEITURAS_DESVIO_CONSECUTIVAS = max(1, int(args.leituras_desvio))
+    LEITURAS_DESVIO_CONSECUTIVAS = max(1, int(
+        args.leituras_desvio
+        if args.leituras_desvio is not None
+        else cfg.get("supervisor_leituras_desvio_consecutivas", LEITURAS_DESVIO_CONSECUTIVAS)
+    ))
     DESVIO_MOVIMENTO_ANGULO_GRAUS = max(
         TOLERANCIA_ANGULO_GRAUS,
         float(cfg.get("supervisor_desvio_angulo_graus", DESVIO_MOVIMENTO_ANGULO_GRAUS)),
@@ -321,6 +341,18 @@ def main():
     DESVIO_MOVIMENTO_DISTANCIA_M = float(
         cfg.get("supervisor_desvio_distancia_cm", DESVIO_MOVIMENTO_DISTANCIA_M * 100)
     ) / 100.0
+    DESVIO_LATERAL_M = float(cfg.get(
+        "supervisor_desvio_lateral_cm", DESVIO_LATERAL_M * 100
+    )) / 100.0
+    RECUPERACAO_PERDA_VISAO_ATIVA = bool(int(cfg.get(
+        "recuperacao_perda_visao_ativa", int(RECUPERACAO_PERDA_VISAO_ATIVA)
+    )))
+    TIMEOUT_PERDA_VISAO_S = float(cfg.get(
+        "timeout_perda_visao_s", TIMEOUT_PERDA_VISAO_S
+    ))
+    DISTANCIA_RECUPERACAO_CM = float(cfg.get(
+        "distancia_recuperacao_cm", DISTANCIA_RECUPERACAO_CM
+    ))
     REENVIAR_META_S = float(cfg.get("supervisor_reenviar_meta_s", REENVIAR_META_S))
     TIMEOUT_FEEDBACK_S = float(cfg.get("supervisor_timeout_feedback_s", TIMEOUT_FEEDBACK_S))
     MAX_REENVIOS_ORIENT_GOAL = max(1, int(cfg.get(
@@ -353,6 +385,8 @@ def main():
         f"orientacao={TOLERANCIA_ANGULO_GRAUS:.0f}deg "
         f"desvio_mov={DESVIO_MOVIMENTO_ANGULO_GRAUS:.0f}deg/"
         f"{DESVIO_MOVIMENTO_DISTANCIA_M*100:.0f}cm "
+        f"lateral={DESVIO_LATERAL_M*100:.0f}cm/{LEITURAS_DESVIO_CONSECUTIVAS} frames "
+        f"recuperacao_visao={'ON' if RECUPERACAO_PERDA_VISAO_ATIVA else 'OFF'} "
         f"reenviar_meta={REENVIAR_META_S:.2f}s "
         f"timeout_feedback={TIMEOUT_FEEDBACK_S:.1f}s "
         f"max_reenvios={MAX_REENVIOS_ORIENT_GOAL}")
@@ -384,6 +418,9 @@ def main():
     full_route_running = False
     t_taxa = time.time()
     backoff = 0.5
+    last_vision_at = time.time()
+    last_seen_near_border = False
+    recovery_attempted = False
 
     def send(tipo: str, segment_id: str | None, estado: dict, metricas: dict | None,
              extra: dict | None = None):
@@ -418,7 +455,13 @@ def main():
                     alvo = estado.get("alvo_destino")
                     robo = estado.get("robo")
                     segment_id = _segment_id(estado)
-                    metricas = _metricas_pose(robo, alvo)
+                    metricas = _metricas_pose(
+                        robo, alvo, estado.get("origem_segmento")
+                    )
+                    now_vision = time.time()
+                    if metricas is not None:
+                        last_vision_at = now_vision
+                        last_seen_near_border = bool(estado.get("robo_perto_borda", False))
 
                     if MODO_SUPERVISAO_UDP == "TRAJETORIA_COMPLETA":
                         trajetoria_id = estado.get("trajetoria_id")
@@ -505,6 +548,7 @@ def main():
                         orientation_done_vision_index = -1
                         bad_readings = 0
                         last_distance = None
+                        recovery_attempted = False
                         if metricas is not None:
                             send("orient_goal", current_segment, estado, metricas)
                             _log_metricas("nova meta de orientacao", metricas, estado)
@@ -552,6 +596,11 @@ def main():
                                 last_distance = None
                                 send("orient_goal", current_segment, estado, metricas)
                                 _log_metricas("chegada rejeitada", metricas, estado)
+                        elif nome == "recovery_done" and phase == "recovering":
+                            phase = "orienting"
+                            phase_started_at = time.time()
+                            orient_resends = 0
+                            log("EVENTO", "Recuperacao local concluida; aguardando regresso da visao.")
 
                     now = time.time()
                     if (
@@ -603,8 +652,13 @@ def main():
                         send("orient_goal", current_segment, estado, metricas)
 
                     if phase == "moving" and metricas is not None:
+                        desvio_lateral = metricas.get("cross_track_error_m")
                         piorou = (
                             abs(metricas["heading_error_deg"]) > DESVIO_MOVIMENTO_ANGULO_GRAUS
+                            or (
+                                desvio_lateral is not None
+                                and desvio_lateral > DESVIO_LATERAL_M
+                            )
                             or (
                                 last_distance is not None
                                 and metricas["distance_m"] > last_distance + DESVIO_MOVIMENTO_DISTANCIA_M
@@ -620,6 +674,28 @@ def main():
                             orient_resends = 0
                             bad_readings = 0
                             _log_metricas("desvio persistente - parar/corrigir", metricas, estado)
+
+                    if (
+                        phase == "moving"
+                        and metricas is None
+                        and RECUPERACAO_PERDA_VISAO_ATIVA
+                        and last_seen_near_border
+                        and not recovery_attempted
+                        and now - last_vision_at >= TIMEOUT_PERDA_VISAO_S
+                    ):
+                        recovery_attempted = True
+                        send(
+                            "vision_recovery",
+                            current_segment,
+                            estado,
+                            None,
+                            extra={"recovery_distance_cm": DISTANCIA_RECUPERACAO_CM},
+                        )
+                        phase = "recovering"
+                        phase_started_at = time.time()
+                        log("AVISO",
+                            f"Visao perdida junto a borda por {now-last_vision_at:.2f}s; "
+                            f"recuperacao local de {DISTANCIA_RECUPERACAO_CM:.0f}cm solicitada.")
 
                     agora_taxa = time.time()
                     if agora_taxa - t_taxa >= 1.0:

@@ -45,8 +45,6 @@ Pastas de dados e artefactos:
 5. `_CONTROL/robot_controller.py` envia comandos ao robo.
 
 Durante a execucao de uma trajetoria, o YOLO e pausado e fica apenas a detecao ArUco.
-Depois de concluir cada conjunto, o sistema mantém o robô parado e pede ENTER
-no terminal antes de voltar a procurar bolas.
 
 ## Parametros Importantes
 
@@ -54,6 +52,17 @@ Todos vivem em `resultados/configuracao/parametros.json`.
 
 - `largura_robo_cm`: largura usada para espaçar as trajetórias horizontais;
   o número de faixas é calculado automaticamente a partir da quadra calibrada.
+- `comprimento_robo_cm`: margem aplicada nos extremos esquerdo e direito para
+  impedir que o corpo do robô seja enviado para fora da zona visível.
+- `supervisor_desvio_lateral_cm`: erro lateral máximo à linha da faixa antes
+  de o servidor interromper a marcha e pedir nova orientação.
+- `supervisor_leituras_desvio_consecutivas`: número de frames fora do corredor
+  antes da interrupção, permitindo ajustar rapidez versus ruído da visão.
+- `recuperacao_perda_visao_ativa`: ativa (`1`) ou desativa (`0`) a manobra local
+  de regresso quando o robô desaparece junto à margem de segurança.
+- `margem_seguranca_borda_cm`, `timeout_perda_visao_s` e
+  `distancia_recuperacao_cm`: definem quando e quanto o ESP32 recua para voltar
+  à zona visível.
 - `tempo_min_estavel_s`: tempo minimo observado antes de uma bola contar como parada.
 - `velocidade_max_bola_parada_cm_s`: velocidade maxima para tratar a bola como parada.
 - `tempo_expirar_bola_s`: tempo sem observacao antes de remover uma bola temporaria.

@@ -32,6 +32,7 @@ Servidor -> ESP32:
 - `move_permission`
 - `stop`
 - `stop_correct`
+- `vision_recovery`
 - `arrived_ok`
 - `arrived_bad`
 
@@ -75,6 +76,11 @@ Neste modo a orientação é incremental:
 
 Pacotes UDP com `seq` antigo são ignorados pelo ESP32 para evitar executar
 correções acumuladas enquanto os motores estavam ocupados.
+
+Durante `driveStraight`, o ESP32 continua a controlar os motores por
+encoders/IMU, mas consulta a fila UDP para aceitar `stop_correct`, `stop` ou
+`vision_recovery`. Na recuperação, para, roda 180 graus localmente e percorre
+a distância autorizada pelo servidor, respondendo `recovery_done`.
 
 Perto da tolerância, o ESP32 não tenta zerar todo o erro: corrige apenas até
 metade da margem angular. Se o erro já estiver dentro da tolerância, não dá

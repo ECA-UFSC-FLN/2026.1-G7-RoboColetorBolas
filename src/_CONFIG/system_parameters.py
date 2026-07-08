@@ -30,6 +30,7 @@ Categorias e respetivos parâmetros (25 no total):
 
   FAIXAS
     largura_robo_cm           largura usada para espaçar as faixas horizontais
+    comprimento_robo_cm       margem longitudinal nos extremos das faixas
     raio_dedup_cm             raio de deduplicação espacial em cm
 
   DISPARO
@@ -420,6 +421,16 @@ ESQUEMA: list[dict] = [
         "max":       200.0,
     },
     {
+        "chave":     "comprimento_robo_cm",
+        "categoria": "FAIXAS",
+        "descricao": "Margem longitudinal para o robô não ultrapassar os extremos da quadra",
+        "unidade":   "cm",
+        "default":   35.0,
+        "tipo":      "float",
+        "min":       0.0,
+        "max":       200.0,
+    },
+    {
         "chave":     "raio_dedup_cm",
         "categoria": "FAIXAS",
         "descricao": "Raio espacial para considerar deteções da mesma bola",
@@ -607,6 +618,66 @@ ESQUEMA: list[dict] = [
         "default":   25.0,
         "tipo":      "float",
         "min":       1.0,
+        "max":       200.0,
+    },
+    {
+        "chave":     "supervisor_desvio_lateral_cm",
+        "categoria": "CONTROLADOR",
+        "descricao": "Desvio máximo à linha da faixa antes de parar e corrigir pela visão",
+        "unidade":   "cm",
+        "default":   8.0,
+        "tipo":      "float",
+        "min":       1.0,
+        "max":       100.0,
+    },
+    {
+        "chave":     "supervisor_leituras_desvio_consecutivas",
+        "categoria": "CONTROLADOR",
+        "descricao": "Frames consecutivos com desvio antes de interromper a marcha",
+        "unidade":   "frames",
+        "default":   2,
+        "tipo":      "int",
+        "min":       1,
+        "max":       20,
+    },
+    {
+        "chave":     "recuperacao_perda_visao_ativa",
+        "categoria": "CONTROLADOR",
+        "descricao": "Ativar recuperação local se o robô desaparecer junto à margem (0=não, 1=sim)",
+        "unidade":   "",
+        "default":   0,
+        "tipo":      "int",
+        "min":       0,
+        "max":       1,
+    },
+    {
+        "chave":     "margem_seguranca_borda_cm",
+        "categoria": "CONTROLADOR",
+        "descricao": "Distância à borda que arma a recuperação em caso de perda de visão",
+        "unidade":   "cm",
+        "default":   20.0,
+        "tipo":      "float",
+        "min":       0.0,
+        "max":       200.0,
+    },
+    {
+        "chave":     "timeout_perda_visao_s",
+        "categoria": "CONTROLADOR",
+        "descricao": "Tempo sem localização junto à margem antes de iniciar recuperação",
+        "unidade":   "s",
+        "default":   0.6,
+        "tipo":      "float",
+        "min":       0.1,
+        "max":       10.0,
+    },
+    {
+        "chave":     "distancia_recuperacao_cm",
+        "categoria": "CONTROLADOR",
+        "descricao": "Distância local após rodar 180 graus para regressar à zona visível",
+        "unidade":   "cm",
+        "default":   30.0,
+        "tipo":      "float",
+        "min":       5.0,
         "max":       200.0,
     },
     {

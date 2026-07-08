@@ -124,6 +124,7 @@ long lastUdpSeq = -1;
 String firstTrajectoryId;
 bool firstTrajectoryCalibration = true;
 String orientationCorrectionMode = "PRIMEIRA_DEVAGAR";
+float requestedRecoveryDistanceCm = 0.0;
 #endif
 
 // ============================================================
@@ -292,6 +293,17 @@ void readImu() {
 // MOVIMENTO
 // ============================================================
 
+enum MotionResult {
+  MOTION_RUNNING,
+  MOTION_ARRIVED,
+  MOTION_STOPPED,
+  MOTION_RECOVERY_REQUESTED
+};
+
+#if USE_UDP
+MotionResult pollMotionInterrupt();
+#endif
+
 int rampBase(float remainingCm) {
   if (remainingCm >= SLOWDOWN_CM) return PWM_CRUISE;
   int x = constrain((int)(remainingCm * 10.0), 0, (int)(SLOWDOWN_CM * 10.0));
@@ -329,7 +341,7 @@ void turnTo(float targetDeg) {
   brakeShort();
 }
 
-void driveStraight(float cm) {
+MotionResult driveStraight(float cm, bool allowUdpInterrupt = true) {
   float controlCm = correctedDistanceCm(cm);
   long targetTicks = lround(controlCm * ticksPerCm);
 
@@ -354,6 +366,17 @@ void driveStraight(float cm) {
   Serial.println(headingRef, 2);
 
   while (true) {
+#if USE_UDP
+    if (allowUdpInterrupt) {
+      MotionResult interruptResult = pollMotionInterrupt();
+      if (interruptResult != MOTION_RUNNING) {
+        stopMotors();
+        brakeShort();
+        Serial.println("drive_interrupted");
+        return interruptResult;
+      }
+    }
+#endif
     readImu();
 
     long l = readTicksL();
@@ -420,6 +443,7 @@ void driveStraight(float cm) {
   Serial.print(" mean=");
   Serial.println(meanTicks, 1);
   Serial.println("ticksPerCm = mean / distancia_real_cm");
+  return MOTION_ARRIVED;
 }
 
 void goToPoint(float x0, float y0, float x1, float y1) {
@@ -504,6 +528,64 @@ void udpEvent(const char* ev) {
   Serial.println(ev);
 }
 
+MotionResult pollMotionInterrupt() {
+  if (udp.parsePacket() <= 0) return MOTION_RUNNING;
+
+  DynamicJsonDocument doc(1024);
+  DeserializationError err = deserializeJson(doc, udp);
+  if (err) {
+    Serial.print("udp_motion_json_error=");
+    Serial.println(err.c_str());
+    return MOTION_RUNNING;
+  }
+
+  serverIp = udp.remoteIP();
+  long commandSeq = doc["seq"] | -1;
+  if (commandSeq >= 0 && commandSeq <= lastUdpSeq) {
+    Serial.print("udp_motion_stale_seq=");
+    Serial.println(commandSeq);
+    return MOTION_RUNNING;
+  }
+  if (commandSeq >= 0) lastUdpSeq = commandSeq;
+
+  const char* type = doc["type"] | "";
+  if (!strcmp(type, "stop") || !strcmp(type, "stop_correct")) {
+    Serial.print("udp_motion_interrupt=");
+    Serial.println(type);
+    return MOTION_STOPPED;
+  }
+  if (!strcmp(type, "vision_recovery")) {
+    requestedRecoveryDistanceCm = max(
+      0.0f,
+      (float)(doc["recovery_distance_cm"] | 30.0)
+    );
+    Serial.print("udp_motion_interrupt=vision_recovery distance_cm=");
+    Serial.println(requestedRecoveryDistanceCm, 1);
+    return MOTION_RECOVERY_REQUESTED;
+  }
+
+  Serial.print("udp_motion_ignored=");
+  Serial.println(type);
+  return MOTION_RUNNING;
+}
+
+void runVisionRecovery(float distanceCm) {
+  stopMotors();
+  brakeShort();
+  headingDeg = 0.0;
+  lastImuMs = millis();
+  Serial.print("vision_recovery_start distance_cm=");
+  Serial.println(distanceCm, 1);
+  turnTo(180.0);
+  MotionResult result = driveStraight(distanceCm, true);
+  if (result == MOTION_ARRIVED) {
+    Serial.println("vision_recovery_end");
+    udpEvent("recovery_done");
+  } else {
+    udpEvent("stopped");
+  }
+}
+
 void runFullTrajectory(JsonArray waypoints, float startX, float startY,
                        float startHeadingDeg) {
   float currentX = startX;
@@ -557,7 +639,17 @@ void runFullTrajectory(JsonArray waypoints, float startX, float startY,
     headingDeg = 0.0;
     lastImuMs = millis();
     turnTo(localTurn);
-    driveStraight(distanceM * 100.0);
+    MotionResult motionResult = driveStraight(distanceM * 100.0);
+    if (motionResult != MOTION_ARRIVED) {
+      stopMotors();
+      if (motionResult == MOTION_RECOVERY_REQUESTED) {
+        runVisionRecovery(requestedRecoveryDistanceCm);
+      } else {
+        udpEvent("stopped");
+      }
+      Serial.println("trajectory_full_interrupted");
+      return;
+    }
 
     currentX = targetX;
     currentY = targetY;
@@ -675,8 +767,20 @@ void udpPoll() {
     delay(250);
     udpEvent("orientation_done");
   } else if (!strcmp(type, "move_permission")) {
-    driveStraight((doc["distance_m"] | 0.0) * 100.0);
-    udpEvent("arrived");
+    MotionResult result = driveStraight((doc["distance_m"] | 0.0) * 100.0);
+    if (result == MOTION_ARRIVED) {
+      udpEvent("arrived");
+    } else if (result == MOTION_RECOVERY_REQUESTED) {
+      runVisionRecovery(requestedRecoveryDistanceCm);
+    } else {
+      udpEvent("stopped");
+    }
+  } else if (!strcmp(type, "vision_recovery")) {
+    requestedRecoveryDistanceCm = max(
+      0.0f,
+      (float)(doc["recovery_distance_cm"] | 30.0)
+    );
+    runVisionRecovery(requestedRecoveryDistanceCm);
   } else if (!strcmp(type, "stop") || !strcmp(type, "stop_correct")) {
     stopMotors();
     udpEvent("stopped");
