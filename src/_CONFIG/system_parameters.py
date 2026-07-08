@@ -29,7 +29,7 @@ Categorias e respetivos parâmetros (25 no total):
     n_obs_estavel_global      mínimo de obs. consecutivas para bola contar (global)
 
   FAIXAS
-    n_faixas                  número de faixas horizontais (1–26)
+    largura_robo_cm           largura usada para espaçar as faixas horizontais
     raio_dedup_cm             raio de deduplicação espacial em cm
 
   DISPARO
@@ -410,14 +410,14 @@ ESQUEMA: list[dict] = [
 
     # ── FAIXAS ─────────────────────────────────────────────────────
     {
-        "chave":     "n_faixas",
+        "chave":     "largura_robo_cm",
         "categoria": "FAIXAS",
-        "descricao": "Número de faixas horizontais em que a quadra é dividida",
-        "unidade":   "",
-        "default":   10,
-        "tipo":      "int",
-        "min":       1,
-        "max":       26,
+        "descricao": "Largura do robô usada como espaçamento entre trajetórias horizontais",
+        "unidade":   "cm",
+        "default":   40.0,
+        "tipo":      "float",
+        "min":       5.0,
+        "max":       200.0,
     },
     {
         "chave":     "raio_dedup_cm",

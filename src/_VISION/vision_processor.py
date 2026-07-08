@@ -138,7 +138,12 @@ def loop_cliente_broadcaster():
                 while True:
                     estado = conn.recv()  # bloqueia até chegar pacote
                     fase = estado.get("fase")
-                    novo = (fase in ("aguarda_inicio", "em_varrimento", "global_executar"))
+                    novo = (fase in (
+                        "aguarda_inicio",
+                        "em_varrimento",
+                        "global_executar",
+                        "aguardar_confirmacao",
+                    ))
                     if novo != _em_disparo:
                         _em_disparo = novo
                         if novo:

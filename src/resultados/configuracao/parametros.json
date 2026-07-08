@@ -1,6 +1,6 @@
 {
     "modo_localizacao_robo": "COR",
-    "n_faixas": 3,
+    "largura_robo_cm": 40.0,
     "raio_dedup_cm": 8.0,
     "threshold_pct": 25.0,
     "k_min": 3,

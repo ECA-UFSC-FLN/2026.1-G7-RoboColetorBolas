@@ -2,7 +2,8 @@
 GraphProcessor.py — Acumulação de Bolas e Geração de Trajetória UFSC/FEUP
 ==========================================================================
 Recebe posições retificadas (metros) do retificador via socket, deduplica
-bolas espacialmente, acumula contagens em N faixas horizontais que se
+bolas espacialmente, acumula contagens em faixas horizontais espaçadas pela
+largura configurada do robô, que se
 ajustam ao polígono da quadra de atuação (definido pelos pontos de
 calibração) e dispara uma trajetória quando uma faixa concentra peso
 suficiente.
@@ -87,7 +88,7 @@ import _CONFIG.system_parameters as _params
 from _PLANNING.ball_collection_planner import BallCollectionPlanner as GlobalPlanner
 _CFG: dict = {}                      # preenchido em main()
 
-N_FAIXAS          = 10
+LARGURA_ROBO_M    = 0.40
 RAIO_DEDUP_M      = 0.08
 THRESHOLD_PCT     = 0.25
 K_MIN             = 4
@@ -262,16 +263,25 @@ class FaixaQuadra:
                 f"peso={self.peso}{' ★' if self.em_execucao else ''}")
 
 
-def construir_faixas(poligono: Polygon, n: int) -> list[FaixaQuadra]:
+def construir_faixas(poligono: Polygon, largura_robo_m: float) -> list[FaixaQuadra]:
+    """Constrói bandas horizontais consecutivas com a largura do robô.
+
+    A última banda é recortada no limite superior da quadra quando a dimensão
+    vertical não é um múltiplo exato da largura configurada.
+    """
+    if largura_robo_m <= 0:
+        raise ValueError("A largura do robô deve ser maior que zero.")
     y_min, y_max = poligono.bounds[1], poligono.bounds[3]
-    altura = (y_max - y_min) / n
     faixas = []
-    for i in range(n):
-        y0 = y_min + i * altura
-        y1 = y_min + (i + 1) * altura
+    y0 = y_min
+    i = 0
+    while y0 < y_max - 1e-9:
+        y1 = min(y0 + largura_robo_m, y_max)
         faixas.append(FaixaQuadra(i, y0, y1, poligono))
-    log("HUMANO", f"Quadra dividida em {n} faixas horizontais.")
-    log("DEBUG",  f"altura por faixa = {altura*100:.1f}cm")
+        y0 = y1
+        i += 1
+    log("HUMANO", f"Quadra dividida em {len(faixas)} faixas horizontais "
+                  f"pela largura do robô ({largura_robo_m*100:.1f}cm).")
     for f in faixas:
         log("DEBUG", f"  {f}  inicio=({f.x_inicial:.2f},{f.y_centro:.2f}) "
                     f"final=({f.x_final:.2f},{f.y_centro:.2f})")
@@ -373,6 +383,7 @@ class EstadoGrafo:
         self.t_disparo_iniciado = 0.0       # timestamp do início do disparo (timeout)
         self.ultimo_indice_disparo = 0      # numerador para os ficheiros gerados
         self.contador_disparos = 0
+        self.aguarda_confirmacao_novo_conjunto = False
 
         # ── Modo GLOBAL ────────────────────────────────────────────
         # planner_global: instância do GlobalPlanner que gere os waypoints TSP
@@ -392,6 +403,39 @@ class EstadoGrafo:
         Usado pelo modo GLOBAL para verificar o threshold global de disparo."""
         agora = time.time()
         return sum(1 for bc in self.bolas if bc.estavel(agora))
+
+
+def solicitar_confirmacao_novo_conjunto(estado: EstadoGrafo, origem: str):
+    """Pausa novos disparos até o operador confirmar no terminal.
+
+    A leitura corre numa thread para não bloquear visão, broadcast ou a ordem
+    de paragem enviada ao robô quando a trajetória termina.
+    """
+    with estado.lock:
+        if estado.aguarda_confirmacao_novo_conjunto:
+            return
+        estado.aguarda_confirmacao_novo_conjunto = True
+
+    def _aguardar():
+        log("HUMANO",
+            f"{origem} concluído. Retira/descarrega as bolas do robô e prime "
+            "ENTER para autorizar o próximo conjunto.")
+        try:
+            input("\n  [CONFIRMAÇÃO] Prime ENTER para procurar o próximo conjunto... ")
+        except EOFError:
+            log("ERRO", "Terminal sem entrada disponível; novos conjuntos continuam bloqueados.")
+            return
+
+        with estado.lock:
+            estado.aguarda_confirmacao_novo_conjunto = False
+            if estado.fase_global == "aguardar_confirmacao":
+                estado.fase_global = "aguardar"
+            if estado.fase_varrimento == "aguardar_confirmacao":
+                estado.fase_varrimento = None
+        log("EVENTO", "Operador confirmou: procura do próximo conjunto autorizada.")
+
+    threading.Thread(target=_aguardar, daemon=True,
+                     name="confirmacao-novo-conjunto").start()
 
 
 # ─────────────────────────────────────────────
@@ -493,10 +537,15 @@ def consumar_disparo(estado: EstadoGrafo, faixa: FaixaQuadra, motivo: str = "con
         faixa.peso = 0
         faixa.em_execucao = False
         estado.disparo_ativo = None
-        estado.fase_varrimento = None
+        pedir_confirmacao = motivo == "concluído"
+        estado.fase_varrimento = (
+            "aguardar_confirmacao" if pedir_confirmacao else None
+        )
         log("HUMANO",
             f"Faixa {faixa.label} {motivo}. Bolas mantidas no estado salvo as "
             f"recolhidas por proximidade ao robô.")
+    if pedir_confirmacao:
+        solicitar_confirmacao_novo_conjunto(estado, f"Conjunto da faixa {faixa.label}")
 
 
 # ─────────────────────────────────────────────
@@ -992,16 +1041,17 @@ def verificar_progresso_global(estado: EstadoGrafo):
 
 
 def _concluir_global(estado: EstadoGrafo):
-    """Limpa o estado GLOBAL e volta a acumular bolas com YOLO ativo."""
+    """Limpa a rota GLOBAL e aguarda autorização para um novo conjunto."""
     for f in estado.faixas:
         f.peso = 0
     recalcular_pesos(estado)
     n_restantes = len(estado.bolas)
     estado.planner_global.cancelar()
-    estado.fase_global = "aguardar"
+    estado.fase_global = "aguardar_confirmacao"
     log("EVENTO",
         f"Rota GLOBAL concluída — {n_restantes} bola(s) ainda no estado. "
-        f"YOLO retomado. A aguardar novo threshold...")
+        f"A aguardar confirmação do operador antes de retomar o YOLO.")
+    solicitar_confirmacao_novo_conjunto(estado, "Conjunto GLOBAL")
 
 
 # ─────────────────────────────────────────────
@@ -1061,9 +1111,13 @@ def broadcast_estado(estado: "EstadoGrafo"):
 
         if modo_op == "GLOBAL":
             fase_global  = estado.fase_global
-            # VisionProcessing usa "fase" para decidir pausar YOLO:
-            # "global_executar" → YOLO off; qualquer outro → YOLO on
-            fase_bc      = "global_executar" if fase_global == "executar" else None
+            # VisionProcessing pausa YOLO durante movimento e confirmação.
+            if fase_global == "executar":
+                fase_bc = "global_executar"
+            elif fase_global == "aguardar_confirmacao":
+                fase_bc = "aguardar_confirmacao"
+            else:
+                fase_bc = None
             faixa_label  = None
             wp           = estado.planner_global.waypoint_atual()
             alvo_destino = {"x": wp[0], "y": wp[1]} if wp else None
@@ -1379,6 +1433,8 @@ class VisualizadorAoVivo:
                 modo = f"GLOBAL — aguardando ≥{K_MIN_GLOBAL} bolas ({n_estaveis} estáveis)"
             elif fg == "calcular":
                 modo = "GLOBAL — a calcular rota TSP..."
+            elif fg == "aguardar_confirmacao":
+                modo = "GLOBAL — AGUARDA CONFIRMAÇÃO NO TERMINAL"
             else:
                 modo = f"GLOBAL ★ EXECUTAR — waypoint {wp_cur}/{wp_tot} ({elapsed:.0f}s)"
         else:
@@ -1390,6 +1446,8 @@ class VisualizadorAoVivo:
                     modo = f"DISPARO ★ Faixa {disparo.label} — VARRIMENTO ({elapsed:.0f}s)"
                 else:
                     modo = f"DISPARO ★ Faixa {disparo.label}"
+            elif fase == "aguardar_confirmacao":
+                modo = "FAIXAS — AGUARDA CONFIRMAÇÃO NO TERMINAL"
             else:
                 modo = "Acumulando..."
         self.ax.set_title(
@@ -1442,8 +1500,8 @@ def processar_pacote(estado: EstadoGrafo, pacote: dict):
             # YOLO está pausado — só ArUco chega; não acumulamos bolas.
             # Apenas avançamos a máquina de waypoints.
             verificar_progresso_global(estado)
-        else:
-            # "aguardar" ou "calcular": YOLO ativo, acumulamos bolas normalmente.
+        elif fase_g in ("aguardar", "calcular"):
+            # YOLO ativo apenas enquanto aguardamos ou calculamos uma rota.
             deduplicar_e_atualizar(estado, bolas)
             recalcular_pesos(estado)
             if fase_g == "calcular":
@@ -1457,7 +1515,7 @@ def processar_pacote(estado: EstadoGrafo, pacote: dict):
 
         if em_disparo:
             verificar_progresso_varrimento(estado)
-        else:
+        elif not estado.aguarda_confirmacao_novo_conjunto:
             deduplicar_e_atualizar(estado, bolas)
             recalcular_pesos(estado)
 
@@ -1468,7 +1526,7 @@ def processar_pacote(estado: EstadoGrafo, pacote: dict):
 #  LOOP PRINCIPAL
 # ─────────────────────────────────────────────
 def main():
-    global N_FAIXAS, RAIO_DEDUP_M, THRESHOLD_PCT, K_MIN, N_OBS_MIN_ESTAVEL
+    global LARGURA_ROBO_M, RAIO_DEDUP_M, THRESHOLD_PCT, K_MIN, N_OBS_MIN_ESTAVEL
     global TEMPO_MIN_ESTAVEL_S, VELOCIDADE_MAX_PARADA_M_S, RAIO_ESTACIONARIA_BOLA_M
     global TEMPO_EXPIRAR_BOLA_S
     global TOLERANCIA_DISTANCIA_AO_PONTO, TOLERANCIA_ANGULO_GRAUS
@@ -1481,7 +1539,9 @@ def main():
 
     # ── Carregar parâmetros configurados pelo utilizador ──
     _CFG = _params.carregar()
-    N_FAIXAS                       = int(_CFG.get("n_faixas", N_FAIXAS))
+    LARGURA_ROBO_M                 = float(_CFG.get(
+        "largura_robo_cm", LARGURA_ROBO_M * 100
+    )) / 100.0
     RAIO_DEDUP_M                   = float(_CFG.get("raio_dedup_cm", RAIO_DEDUP_M*100)) / 100.0
     THRESHOLD_PCT                  = float(_CFG.get("threshold_pct", THRESHOLD_PCT*100)) / 100.0
     K_MIN                          = int(_CFG.get("k_min", K_MIN))
@@ -1522,10 +1582,12 @@ def main():
               f"{len(pontos)} pontos de calibração")
 
     poligono = construir_poligono_quadra(pontos)
-    faixas   = construir_faixas(poligono, N_FAIXAS)
+    faixas   = construir_faixas(poligono, LARGURA_ROBO_M)
     estado   = EstadoGrafo(faixas, poligono, calib)
 
-    log("DEBUG", f"Configuração: N={N_FAIXAS} | raio={RAIO_DEDUP_M*100:.1f}cm | "
+    log("DEBUG", f"Configuração: faixas={len(faixas)} | "
+                f"largura robô={LARGURA_ROBO_M*100:.1f}cm | "
+                f"raio={RAIO_DEDUP_M*100:.1f}cm | "
                 f"threshold={int(THRESHOLD_PCT*100)}% | K_min={K_MIN} | "
                 f"n_obs_min={N_OBS_MIN_ESTAVEL} | tempo_estável={TEMPO_MIN_ESTAVEL_S:.1f}s | "
                 f"v_parada≤{VELOCIDADE_MAX_PARADA_M_S*100:.1f}cm/s")
@@ -1583,7 +1645,8 @@ def main():
                     # ── Modo FAIXAS — lógica original ──
                     with estado.lock:
                         em_disparo = estado.disparo_ativo is not None
-                    if not em_disparo:
+                        aguarda_confirmacao = estado.aguarda_confirmacao_novo_conjunto
+                    if not em_disparo and not aguarda_confirmacao:
                         faixa = verificar_disparo(estado)
                         if faixa is not None:
                             with estado.lock:

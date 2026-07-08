@@ -45,11 +45,15 @@ Pastas de dados e artefactos:
 5. `_CONTROL/robot_controller.py` envia comandos ao robo.
 
 Durante a execucao de uma trajetoria, o YOLO e pausado e fica apenas a detecao ArUco.
+Depois de concluir cada conjunto, o sistema mantém o robô parado e pede ENTER
+no terminal antes de voltar a procurar bolas.
 
 ## Parametros Importantes
 
 Todos vivem em `resultados/configuracao/parametros.json`.
 
+- `largura_robo_cm`: largura usada para espaçar as trajetórias horizontais;
+  o número de faixas é calculado automaticamente a partir da quadra calibrada.
 - `tempo_min_estavel_s`: tempo minimo observado antes de uma bola contar como parada.
 - `velocidade_max_bola_parada_cm_s`: velocidade maxima para tratar a bola como parada.
 - `tempo_expirar_bola_s`: tempo sem observacao antes de remover uma bola temporaria.
